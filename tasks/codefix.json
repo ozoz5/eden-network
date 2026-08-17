@@ -1,0 +1,14 @@
+{
+  "task_contract_version": "code-fix/1",
+  "task_type": "code-fix",
+  "title": "Fix stats.median so all 12 tests pass",
+  "module_name": "stats",
+  "source_file": "tasks/codefix/buggy_stats.py",
+  "test_file": "tasks/codefix/test_stats.py",
+  "tests_total": 12,
+  "quality": {
+    "type": "tests-pass"
+  },
+  "input_schema": "python-source",
+  "resource_boundary_profile": "single-process/child-cpu/incl-interpreter-startup"
+}

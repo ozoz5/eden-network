@@ -1,0 +1,18 @@
+{
+  "task_contract_version": "topk-words/1",
+  "title": "Top-k word frequency (deterministic synthetic corpus)",
+  "generator": {
+    "type": "synthetic-words",
+    "seed": 42,
+    "vocab": 800,
+    "tokens": 200000,
+    "zipf": 1.1
+  },
+  "k": 10,
+  "quality": {
+    "type": "exact-match",
+    "tie_break": "higher count first, then lexicographic word"
+  },
+  "input_schema": "text/plain whitespace-separated words",
+  "resource_boundary_profile": "single-process/child-cpu/incl-interpreter-startup"
+}

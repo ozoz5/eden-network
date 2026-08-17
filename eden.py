@@ -1,0 +1,925 @@
+#!/usr/bin/env python3
+"""EDEN v0 - Minimal Efficiency Receipt pipeline.
+
+Implements the cut line of EDEN設計書.md §7:
+
+    task -> run -> measure -> verify -> receipt -> frontier (SELECT) -> mint (simulated)
+
+Constitution (§1) enforced in code:
+  I   Observation Before Prediction: frontier and mint use observed receipts only.
+  II  Result Before Efficiency:      receipts are issued only for PASS runs.
+  III Net Efficiency Only:           certified gain subtracts verification energy.
+  IV  Facts Outlive Rules:           receipts store raw observations (cpu seconds,
+      meter model parameters); joules are derived and re-derivable later.
+
+Single file on purpose (v0). Python stdlib only. SQLite ledger.
+"""
+
+import argparse
+import hashlib
+import inspect
+import json
+import platform
+import random
+import resource
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+
+BASE = Path(__file__).resolve().parent
+DB_PATH = BASE / "eden.db"
+DATA_DIR = BASE / "data"
+RUNNERS_DIR = BASE / "runners"
+
+RECEIPT_VERSION = "eden-receipt/2"
+# §2.1: fields that must never appear in a receipt (economic interpretation).
+FORBIDDEN_RECEIPT_KEYS = ("baseline", "saved", "mint", "efficiency_ratio")
+K_SIGMA = 2.0  # interval half-width multiplier for certified dominance
+
+
+def sha(data) -> str:
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def canonical(obj) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+
+
+# ---------------------------------------------------------------- measurement
+
+class MeasurementAdapter:
+    """Interface per 設計書 v1 §20 (start/stop/energy/confidence/method)."""
+
+    def start(self): raise NotImplementedError
+    def stop(self): raise NotImplementedError
+    def energy_joules(self) -> float: raise NotImplementedError
+    def cpu_seconds(self) -> float: raise NotImplementedError
+    def wall_seconds(self) -> float: raise NotImplementedError
+    def confidence(self) -> float: raise NotImplementedError
+    def method(self) -> str: raise NotImplementedError
+    def profile(self) -> dict: raise NotImplementedError
+
+
+class EstimatedCpuAdapter(MeasurementAdapter):
+    """Level S (estimated): child-process CPU time x assumed watts.
+
+    cpu_seconds is a MEASURED fact (getrusage RUSAGE_CHILDREN delta).
+    joules are DERIVED from an assumed constant; the constant is declared in
+    the meter profile so receipts can be re-derived later (Constitution IV).
+    """
+
+    PROFILE_ID = "estimated-cpu-v1"
+    METHOD = "estimated"
+    WATTS_PER_CPU_SECOND = 6.0  # assumed active power per busy core; NOT measured
+    ASSIGNED_CV = 0.15          # protocol-assigned relative uncertainty (fallback
+                                # when a group has too few repeats to estimate sigma)
+    CONFIDENCE = 0.4
+
+    def start(self):
+        ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+        self._c0 = ru.ru_utime + ru.ru_stime
+        self._t0 = time.monotonic()
+
+    def stop(self):
+        self._wall = time.monotonic() - self._t0
+        ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+        self._cpu = (ru.ru_utime + ru.ru_stime) - self._c0
+
+    def cpu_seconds(self): return self._cpu
+    def wall_seconds(self): return self._wall
+    def energy_joules(self): return self._cpu * self.WATTS_PER_CPU_SECOND
+    def confidence(self): return self.CONFIDENCE
+    def method(self): return self.METHOD
+
+    def profile(self) -> dict:
+        return {
+            "meter_profile_id": self.PROFILE_ID,
+            "method": self.METHOD,
+            "raw_observable": "child_cpu_seconds (getrusage RUSAGE_CHILDREN)",
+            "watts_per_cpu_second_assumed": self.WATTS_PER_CPU_SECOND,
+            "assigned_cv": self.ASSIGNED_CV,
+            "confidence": self.CONFIDENCE,
+        }
+
+
+def _parse_cputime(text: str) -> float:
+    """Parse ps cputime: [[DD-]HH:]MM:SS.ss -> seconds."""
+    days = 0
+    if "-" in text:
+        d, text = text.split("-", 1)
+        days = int(d)
+    parts = [float(x) for x in text.split(":")]
+    seconds = 0.0
+    for p in parts:
+        seconds = seconds * 60 + p
+    return days * 86400 + seconds
+
+
+class OllamaCpuAdapter(EstimatedCpuAdapter):
+    """Level S for local-LLM runners: child cpu + ollama daemon cpu delta.
+
+    Inference happens inside the ollama daemon, not in our child process, so
+    the daemon's cpu time is sampled (ps cputime) before and after the run.
+    Boundary assumes a warm (already loaded) model and no concurrent daemon
+    load; both assumptions are declared, not verified (Level S).
+    """
+
+    PROFILE_ID = "estimated-cpu+ollama-v1"
+    ASSIGNED_CV = 0.25  # daemon sampling is coarser than child rusage
+    BOUNDARY = "child-cpu + ollama-daemon-cpu-delta (warm model, exclusive use)"
+
+    @staticmethod
+    def _daemon_cpu() -> float:
+        try:
+            pids = subprocess.run(["pgrep", "ollama"], capture_output=True,
+                                  text=True).stdout.split()
+            total = 0.0
+            for pid in pids:
+                out = subprocess.run(["ps", "-o", "cputime=", "-p", pid],
+                                     capture_output=True, text=True).stdout.strip()
+                if out:
+                    total += _parse_cputime(out)
+            return total
+        except (OSError, ValueError):
+            return 0.0
+
+    def start(self):
+        self._d0 = self._daemon_cpu()
+        super().start()
+
+    def stop(self):
+        super().stop()
+        self._cpu += max(0.0, self._daemon_cpu() - self._d0)
+
+    def profile(self) -> dict:
+        p = super().profile()
+        # Honest declaration: on Apple Silicon, ollama inference runs on the
+        # GPU/ANE, whose energy is invisible to cpu-time sampling. These
+        # joules are a LOWER BOUND until a Level V/P meter exists.
+        p["limitation"] = "GPU/ANE energy not captured (cpu-time only); joules are a lower bound"
+        return p
+
+
+EstimatedCpuAdapter.BOUNDARY = None
+METERS = {"estimated": EstimatedCpuAdapter, "ollama": OllamaCpuAdapter}
+
+
+def run_measured(cmd: list, cwd=None, meter: str = "estimated") -> dict:
+    """Run a child process wrapped in a measurement adapter."""
+    adapter = METERS[meter]()
+    adapter.start()
+    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+    adapter.stop()
+    return {
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+        "cpu_seconds": adapter.cpu_seconds(),
+        "wall_seconds": adapter.wall_seconds(),
+        "energy_joules": adapter.energy_joules(),
+        "adapter": adapter,
+    }
+
+
+# ------------------------------------------------------------------- verifier
+
+def reference_topk(words, k):
+    """Reference implementation used by the verifier (exact-match quality).
+
+    Deterministic tie-break: higher count first, then lexicographic word.
+    The source code of this function is part of the verifier spec hash.
+    """
+    counts = Counter(words)
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [[w, c] for w, c in ranked[:k]]
+
+
+VERIFIER_ID = "ref-exact-v1"
+VERIFIER_ID_TESTS = "unittest-v1"
+
+
+def verifier_spec_hash(spec=None) -> str:
+    """Verifier identity. code-fix: hash of the test suite. topk: reference source."""
+    if spec is not None and spec.get("task_type") == "code-fix":
+        test_bytes = (BASE / spec["test_file"]).read_bytes()
+        return sha(test_bytes + b"|tests-pass")[:16]
+    return sha(inspect.getsource(reference_topk) + "|exact-match")[:16]
+
+
+# ------------------------------------------------------------------------ db
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS tasks(
+  task_instance_id TEXT PRIMARY KEY,
+  family_id TEXT NOT NULL,
+  task_contract_version TEXT NOT NULL,
+  spec_json TEXT NOT NULL,
+  input_path TEXT NOT NULL,
+  input_hash TEXT NOT NULL,
+  verifier_spec_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runs(
+  run_id TEXT PRIMARY KEY,
+  task_instance_id TEXT NOT NULL,
+  runner_id TEXT NOT NULL,
+  runner_code_hash TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  completed_at TEXT,
+  status TEXT NOT NULL,
+  output_json TEXT,
+  output_hash TEXT
+);
+CREATE TABLE IF NOT EXISTS measurements(
+  run_id TEXT PRIMARY KEY,
+  method TEXT NOT NULL,
+  meter_profile_json TEXT NOT NULL,
+  energy_boundary TEXT NOT NULL,
+  cpu_seconds REAL NOT NULL,
+  wall_seconds REAL NOT NULL,
+  energy_joules REAL NOT NULL,
+  confidence REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS verifications(
+  run_id TEXT PRIMARY KEY,
+  verifier_id TEXT NOT NULL,
+  verifier_spec_hash TEXT NOT NULL,
+  status TEXT NOT NULL,
+  score REAL NOT NULL,
+  verify_cpu_seconds REAL NOT NULL,
+  verify_energy_joules REAL NOT NULL,
+  verified_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS receipts(
+  receipt_id TEXT PRIMARY KEY,
+  run_id TEXT UNIQUE NOT NULL,
+  family_id TEXT NOT NULL,
+  receipt_json TEXT NOT NULL,
+  receipt_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS frontier_state(
+  family_id TEXT PRIMARY KEY,
+  group_key TEXT NOT NULL,
+  n INTEGER NOT NULL,
+  mean_j REAL NOT NULL,
+  low_j REAL NOT NULL,
+  high_j REAL NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mints(
+  mint_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  family_id TEXT NOT NULL,
+  prev_group TEXT NOT NULL,
+  new_group TEXT NOT NULL,
+  prev_low_j REAL NOT NULL,
+  new_high_j REAL NOT NULL,
+  verify_energy_j REAL NOT NULL,
+  certified_gain_j REAL NOT NULL,
+  note TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+"""
+
+
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA)
+    return conn
+
+
+# ----------------------------------------------------------------------- task
+
+def generate_corpus(gen: dict) -> str:
+    rnd = random.Random(gen["seed"])
+    vocab = [f"w{i:04d}" for i in range(gen["vocab"])]
+    weights = [1.0 / (i + 1) ** gen["zipf"] for i in range(gen["vocab"])]
+    words = rnd.choices(vocab, weights=weights, k=gen["tokens"])
+    return " ".join(words)
+
+
+def family_id_of(spec: dict) -> str:
+    """§4: family_id is derived mechanically, never self-declared.
+
+    topk: the generator SEED is excluded (it identifies the instance).
+    code-fix: the verifier spec (test suite) carries the family identity.
+    """
+    if spec.get("task_type") == "code-fix":
+        material = "|".join([
+            spec["task_contract_version"],
+            verifier_spec_hash(spec),
+            spec["input_schema"],
+            "code-fix",
+            spec["quality"]["type"],
+            spec["resource_boundary_profile"],
+        ])
+    else:
+        gen = dict(spec["generator"])
+        gen.pop("seed", None)
+        material = "|".join([
+            spec["task_contract_version"],
+            verifier_spec_hash(spec),
+            spec["input_schema"],
+            canonical(gen),
+            spec["quality"]["type"],
+            spec["resource_boundary_profile"],
+        ])
+    return sha(material)[:16]
+
+
+def cmd_task_create(spec_path: str):
+    spec = json.loads(Path(spec_path).read_text())
+    fam = family_id_of(spec)
+
+    if spec.get("task_type") == "code-fix":
+        src_path = BASE / spec["source_file"]
+        input_hash = sha(src_path.read_bytes())[:16]
+        task_id = sha(fam + input_hash)[:16]
+        input_path = src_path  # the buggy source itself is the input
+    else:
+        corpus = generate_corpus(spec["generator"])
+        input_hash = sha(corpus)[:16]
+        task_id = sha(fam + str(spec["generator"]["seed"]) + input_hash)[:16]
+        DATA_DIR.mkdir(exist_ok=True)
+        input_path = DATA_DIR / f"{task_id}.txt"
+        if not input_path.exists():
+            input_path.write_text(corpus)
+
+    conn = db()
+    conn.execute(
+        "INSERT OR IGNORE INTO tasks VALUES (?,?,?,?,?,?,?,?)",
+        (task_id, fam, spec["task_contract_version"], canonical(spec),
+         str(input_path), input_hash, verifier_spec_hash(spec), now_iso()),
+    )
+    conn.commit()
+    print(f"task_instance_id: {task_id}")
+    print(f"family_id:        {fam}")
+    print(f"input:            {input_path.name}  hash={input_hash}")
+    print(f"verifier_spec:    {verifier_spec_hash(spec)}")
+    return task_id
+
+
+def resolve_task(conn, prefix: str):
+    rows = conn.execute(
+        "SELECT * FROM tasks WHERE task_instance_id LIKE ?", (prefix + "%",)
+    ).fetchall()
+    if not rows:
+        sys.exit(f"error: no task matching '{prefix}' (run: eden task create <spec.json>)")
+    if len(rows) > 1:
+        sys.exit(f"error: ambiguous task prefix '{prefix}' ({len(rows)} matches)")
+    return rows[0]
+
+
+# ------------------------------------------------------------------------ run
+
+def cmd_run(task_prefix: str, runner: str, repeat: int, chain: bool = True,
+            meter: str = None):
+    conn = db()
+    task = resolve_task(conn, task_prefix)
+    runner_path = RUNNERS_DIR / f"{runner}.py"
+    if not runner_path.exists():
+        available = sorted(p.stem for p in RUNNERS_DIR.glob("*.py"))
+        sys.exit(f"error: runner '{runner}' not found. available: {', '.join(available)}")
+    runner_hash = sha(runner_path.read_bytes())[:16]
+    spec = json.loads(task["spec_json"])
+    if spec.get("task_type") == "code-fix":
+        extra = [str(BASE / spec["test_file"]), spec["module_name"]]
+    else:
+        extra = [str(spec["k"])]
+    # LLM runners burn cpu inside the ollama daemon -> different meter needed.
+    meter = meter or ("ollama" if "llm" in runner else "estimated")
+
+    run_ids = []
+    for i in range(repeat):
+        started = now_iso()
+        result = run_measured(
+            [sys.executable, str(runner_path), task["input_path"], *extra],
+            meter=meter,
+        )
+        status = "DONE" if result["returncode"] == 0 else "ERROR"
+        output_json, output_hash = None, None
+        if status == "DONE":
+            try:
+                output_json = canonical(json.loads(result["stdout"]))
+                output_hash = sha(output_json)[:16]
+            except json.JSONDecodeError:
+                status = "ERROR"
+        run_id = sha(task["task_instance_id"] + runner + started + str(i)
+                     + str(result["cpu_seconds"]))[:16]
+        conn.execute(
+            "INSERT INTO runs VALUES (?,?,?,?,?,?,?,?,?)",
+            (run_id, task["task_instance_id"], runner, runner_hash,
+             started, now_iso(), status, output_json, output_hash),
+        )
+        adapter = result["adapter"]
+        conn.execute(
+            "INSERT INTO measurements VALUES (?,?,?,?,?,?,?,?)",
+            (run_id, adapter.method(), canonical(adapter.profile()),
+             adapter.BOUNDARY or spec["resource_boundary_profile"],
+             result["cpu_seconds"], result["wall_seconds"],
+             result["energy_joules"], adapter.confidence()),
+        )
+        conn.commit()
+        print(f"run {run_id}  runner={runner}  status={status}  "
+              f"E={result['energy_joules']:.3f} J  cpu={result['cpu_seconds']:.3f} s")
+        if status == "ERROR":
+            print(f"  stderr: {result['stderr'].strip()[:200]}")
+        run_ids.append(run_id)
+        if chain and status == "DONE":
+            v = cmd_verify(run_id, conn)
+            if v == "PASS":
+                cmd_receipt_emit(run_id, conn, quiet=True)
+    return run_ids
+
+
+# --------------------------------------------------------------------- verify
+
+def cmd_verify(run_id_prefix: str, conn=None) -> str:
+    conn = conn or db()
+    run = conn.execute(
+        "SELECT * FROM runs WHERE run_id LIKE ?", (run_id_prefix + "%",)
+    ).fetchone()
+    if run is None:
+        sys.exit(f"error: no run matching '{run_id_prefix}'")
+    task = conn.execute(
+        "SELECT * FROM tasks WHERE task_instance_id=?", (run["task_instance_id"],)
+    ).fetchone()
+    spec = json.loads(task["spec_json"])
+
+    # Verification is real work in a measured child process, so verification
+    # energy is observed (§III).
+    if spec.get("task_type") == "code-fix":
+        verifier_id = VERIFIER_ID_TESTS
+        status, result = "FAIL", None
+        if run["status"] == "DONE" and run["output_json"]:
+            source = json.loads(run["output_json"]).get("source", "")
+            test_path = BASE / spec["test_file"]
+            with tempfile.TemporaryDirectory() as td:
+                Path(td, spec["module_name"] + ".py").write_text(source)
+                shutil.copy(test_path, Path(td) / test_path.name)
+                result = run_measured(
+                    [sys.executable, "-m", "unittest", test_path.stem, "-v"],
+                    cwd=td,
+                )
+            status = "PASS" if result["returncode"] == 0 else "FAIL"
+        if result is None:  # runner produced nothing verifiable
+            result = {"cpu_seconds": 0.0, "energy_joules": 0.0}
+    else:
+        verifier_id = VERIFIER_ID
+        result = run_measured(
+            [sys.executable, str(BASE / "eden.py"), "_refverify",
+             task["input_path"], str(spec["k"])]
+        )
+        expected = canonical(json.loads(result["stdout"]))
+        status = ("PASS" if (run["output_json"] == expected
+                             and run["status"] == "DONE") else "FAIL")
+    conn.execute(
+        "INSERT OR REPLACE INTO verifications VALUES (?,?,?,?,?,?,?,?)",
+        (run["run_id"], verifier_id, task["verifier_spec_hash"], status,
+         1.0 if status == "PASS" else 0.0,
+         result["cpu_seconds"], result["energy_joules"], now_iso()),
+    )
+    conn.commit()
+    print(f"verify {run['run_id']}  {status}  "
+          f"E_verify={result['energy_joules']:.3f} J")
+    return status
+
+
+# -------------------------------------------------------------------- receipt
+
+def build_receipt(conn, run_id: str):
+    row = conn.execute(
+        """SELECT r.*, t.family_id, t.task_contract_version, t.input_hash,
+                  t.spec_json,
+                  m.meter_profile_json, m.energy_boundary, m.cpu_seconds,
+                  m.wall_seconds, m.energy_joules, m.confidence,
+                  v.status AS v_status, v.score, v.verifier_id,
+                  v.verifier_spec_hash AS v_spec,
+                  v.verify_cpu_seconds, v.verify_energy_joules
+           FROM runs r
+           JOIN tasks t ON t.task_instance_id = r.task_instance_id
+           JOIN measurements m ON m.run_id = r.run_id
+           JOIN verifications v ON v.run_id = r.run_id
+           WHERE r.run_id = ?""",
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        sys.exit(f"error: run '{run_id}' lacks measurement or verification")
+    if row["v_status"] != "PASS":
+        # Constitution II: no receipt without a proven result.
+        return None
+    meter = json.loads(row["meter_profile_json"])
+    spec = json.loads(row["spec_json"])
+    receipt = {
+        "receipt_version": RECEIPT_VERSION,
+        "family_id": row["family_id"],
+        "task_instance_id": row["task_instance_id"],
+        "task_contract_version": row["task_contract_version"],
+        "input_hash": row["input_hash"],
+        "output_hash": row["output_hash"],
+        "result": {
+            "quality_metric": spec["quality"]["type"],
+            "status": "PASS",
+            "score": row["score"],
+        },
+        "run_energy": {
+            "cpu_seconds": row["cpu_seconds"],        # raw observation
+            "wall_seconds": row["wall_seconds"],      # raw observation
+            "energy_joules": row["energy_joules"],    # derived (see meter profile)
+        },
+        "verification_energy": {
+            "cpu_seconds": row["verify_cpu_seconds"],
+            "energy_joules": row["verify_energy_joules"],
+        },
+        "energy_boundary": row["energy_boundary"],
+        "measurement_profile": meter,
+        "uncertainty_profile": {
+            "assigned_cv": meter["assigned_cv"],
+            "assignment": "protocol-assigned per meter profile; group sigma "
+                          "replaces it when >=3 replications exist",
+        },
+        "verifier_spec_hash": row["v_spec"],
+        "runner_id": row["runner_id"],
+        "runner_code_hash": row["runner_code_hash"],
+        "meter_id": meter["meter_profile_id"],
+        "verifier_id": row["verifier_id"],
+        "hardware_profile": {
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+        },
+        "timestamp": row["completed_at"],
+        "signatures": [],
+    }
+    # §2.1 invariant: economic interpretation must never enter a receipt.
+    flat = canonical(receipt)
+    for key in FORBIDDEN_RECEIPT_KEYS:
+        assert f'"{key}' not in flat, f"forbidden field '{key}' in receipt"
+    return receipt
+
+
+def cmd_receipt_emit(run_id_prefix: str, conn=None, quiet=False):
+    conn = conn or db()
+    run = conn.execute(
+        "SELECT run_id FROM runs WHERE run_id LIKE ?", (run_id_prefix + "%",)
+    ).fetchone()
+    if run is None:
+        sys.exit(f"error: no run matching '{run_id_prefix}'")
+    receipt = build_receipt(conn, run["run_id"])
+    if receipt is None:
+        print(f"receipt refused for {run['run_id']}: verification is not PASS "
+              "(Constitution II: Result Before Efficiency)")
+        return None
+    rj = canonical(receipt)
+    rhash = sha(rj)[:16]
+    conn.execute(
+        "INSERT OR IGNORE INTO receipts VALUES (?,?,?,?,?,?)",
+        (rhash, run["run_id"], receipt["family_id"], rj, rhash, now_iso()),
+    )
+    conn.commit()
+    if not quiet:
+        print(json.dumps(receipt, indent=2))
+        print(f"receipt_hash: {rhash}")
+    return rhash
+
+
+def cmd_receipt_show(run_id_prefix: str):
+    conn = db()
+    row = conn.execute(
+        """SELECT rc.* FROM receipts rc JOIN runs r ON r.run_id = rc.run_id
+           WHERE r.run_id LIKE ?""", (run_id_prefix + "%",)
+    ).fetchone()
+    if row is None:
+        sys.exit(f"error: no receipt for run '{run_id_prefix}'")
+    print(json.dumps(json.loads(row["receipt_json"]), indent=2))
+    print(f"receipt_hash: {row['receipt_hash']}")
+
+
+# ------------------------------------------------------------------- frontier
+
+def group_stats(conn, family_id: str):
+    """Frontier input = receipts only (Constitution I). Grouped by runner.
+
+    A group is a replication set (same runner solution). Sigma of the mean
+    shrinks with sqrt(n) (設計書 §3: interval narrowing through replication).
+    """
+    rows = conn.execute(
+        "SELECT receipt_json FROM receipts WHERE family_id=?", (family_id,)
+    ).fetchall()
+    groups = {}
+    for r in rows:
+        rec = json.loads(r["receipt_json"])
+        g = groups.setdefault(rec["runner_id"], {"e": [], "v": [], "cv": None})
+        g["e"].append(rec["run_energy"]["energy_joules"])
+        g["v"].append(rec["verification_energy"]["energy_joules"])
+        g["cv"] = rec["uncertainty_profile"]["assigned_cv"]
+    out = []
+    for key, g in groups.items():
+        n = len(g["e"])
+        mean = sum(g["e"]) / n
+        if n >= 3:
+            var = sum((x - mean) ** 2 for x in g["e"]) / (n - 1)
+            sigma = var ** 0.5
+        else:
+            sigma = g["cv"] * mean  # protocol-assigned fallback
+        sem = sigma / (n ** 0.5)
+        out.append({
+            "group": key, "n": n, "mean": mean, "sigma": sigma,
+            "low": mean - K_SIGMA * sem, "high": mean + K_SIGMA * sem,
+            "verify_mean": sum(g["v"]) / n,
+        })
+    out.sort(key=lambda g: g["high"])
+    return out
+
+
+def cmd_frontier(task_prefix: str):
+    conn = db()
+    task = resolve_task(conn, task_prefix)
+    fam = task["family_id"]
+    groups = group_stats(conn, fam)
+    if not groups:
+        print(f"family {fam}: no receipts yet. frontier is empty.")
+        return
+
+    print(f"family {fam}  (verified receipt groups, interval = mean ± {K_SIGMA:g}σ/√n)")
+    for g in groups:
+        print(f"  {g['group']:<14} n={g['n']:<3} E={g['mean']:8.3f} J  "
+              f"[{g['low']:.3f}, {g['high']:.3f}]  ρ={g['verify_mean']/g['mean']:.2f}")
+
+    candidate = groups[0]
+    state = conn.execute(
+        "SELECT * FROM frontier_state WHERE family_id=?", (fam,)
+    ).fetchone()
+
+    if state is None:
+        conn.execute(
+            "INSERT INTO frontier_state VALUES (?,?,?,?,?,?,?)",
+            (fam, candidate["group"], candidate["n"], candidate["mean"],
+             candidate["low"], candidate["high"], now_iso()),
+        )
+        conn.commit()
+        print()
+        print("  " + "=" * 52)
+        print(f"  FIRST RECORD   family={fam}")
+        print(f"  {candidate['group']}: {candidate['mean']:.3f} J  "
+              f"[{candidate['low']:.3f}, {candidate['high']:.3f}]  n={candidate['n']}")
+        print("  " + "=" * 52)
+        return
+
+    holder = next((g for g in groups if g["group"] == state["group_key"]), None)
+    if holder is None:
+        holder = candidate
+    if candidate["group"] == holder["group"]:
+        conn.execute(
+            "UPDATE frontier_state SET n=?, mean_j=?, low_j=?, high_j=?, updated_at=? "
+            "WHERE family_id=?",
+            (holder["n"], holder["mean"], holder["low"], holder["high"],
+             now_iso(), fam),
+        )
+        conn.commit()
+        print(f"\n  frontier unchanged: {holder['group']} "
+              f"[{holder['low']:.3f}, {holder['high']:.3f}] J")
+        return
+
+    # Certified dominance (§3): challenger high must clear holder low.
+    if candidate["high"] < holder["low"]:
+        gain = max(0.0, holder["low"] - candidate["high"] - candidate["verify_mean"])
+        conn.execute(
+            "INSERT INTO mints(family_id, prev_group, new_group, prev_low_j, "
+            "new_high_j, verify_energy_j, certified_gain_j, note, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (fam, holder["group"], candidate["group"], holder["low"],
+             candidate["high"], candidate["verify_mean"], gain,
+             "SIMULATED", now_iso()),
+        )
+        conn.execute(
+            "UPDATE frontier_state SET group_key=?, n=?, mean_j=?, low_j=?, "
+            "high_j=?, updated_at=? WHERE family_id=?",
+            (candidate["group"], candidate["n"], candidate["mean"],
+             candidate["low"], candidate["high"], now_iso(), fam),
+        )
+        conn.commit()
+        print()
+        print("  " + "=" * 52)
+        print(f"  NEW FRONTIER   family={fam}")
+        print(f"  Previous: {holder['mean']:8.3f} J ±{K_SIGMA*holder['sigma']/holder['n']**0.5:.3f}"
+              f"  ({holder['group']}, n={holder['n']})")
+        print(f"  New:      {candidate['mean']:8.3f} J ±{K_SIGMA*candidate['sigma']/candidate['n']**0.5:.3f}"
+              f"  ({candidate['group']}, n={candidate['n']})")
+        print(f"  ΔE(mean): {holder['mean']-candidate['mean']:.3f} J")
+        print(f"  Certified net gain (III): {gain:.3f} J"
+              f"   [= prev_low − new_high − E_verify]")
+        print(f"  MINT (simulated): +{gain:.3f} CREDIT")
+        print("  " + "=" * 52)
+    else:
+        print(f"\n  challenger {candidate['group']} not certified: interval "
+              f"[{candidate['low']:.3f}, {candidate['high']:.3f}] overlaps holder "
+              f"low {holder['low']:.3f} (add replications to narrow σ/√n)")
+
+
+# ------------------------------------------------------------------ calibrate
+
+def cmd_calibrate(task_prefix: str, runner: str):
+    conn = db()
+    task = resolve_task(conn, task_prefix)
+    rows = conn.execute(
+        """SELECT rc.receipt_json FROM receipts rc JOIN runs r ON r.run_id=rc.run_id
+           WHERE rc.family_id=? AND r.runner_id=?""",
+        (task["family_id"], runner),
+    ).fetchall()
+    energies = [json.loads(r["receipt_json"])["run_energy"]["energy_joules"]
+                for r in rows]
+    if len(energies) < 2:
+        print(f"calibrate: need >=2 receipts for {runner} (have {len(energies)})")
+        return
+    n = len(energies)
+    mean = sum(energies) / n
+    var = sum((x - mean) ** 2 for x in energies) / (n - 1)
+    sigma = var ** 0.5
+    print(f"calibration  runner={runner}  family={task['family_id']}")
+    print("  " + " / ".join(f"{e:.3f}" for e in energies) + "  J")
+    print(f"  n={n}  mean={mean:.3f} J  σ={sigma:.3f} J  cv={sigma/mean*100:.1f}%")
+    print(f"  minimum certifiable improvement (single run, {K_SIGMA:g}σ): "
+          f"{K_SIGMA*sigma:.3f} J")
+    print(f"  minimum certifiable improvement (n={n} replications, "
+          f"{K_SIGMA:g}σ/√n): {K_SIGMA*sigma/n**0.5:.3f} J")
+
+
+# ----------------------------------------------------------------------- demo
+
+def summary_jps(task_prefix: str):
+    """§8 primary metric: joules per successful task (all runs incl. failures)."""
+    conn = db()
+    task = resolve_task(conn, task_prefix)
+    rows = conn.execute(
+        """SELECT r.runner_id,
+                  COUNT(*) AS runs,
+                  SUM(CASE WHEN v.status='PASS' THEN 1 ELSE 0 END) AS passes,
+                  SUM(m.energy_joules) AS total_j
+           FROM runs r
+           JOIN measurements m ON m.run_id = r.run_id
+           LEFT JOIN verifications v ON v.run_id = r.run_id
+           WHERE r.task_instance_id=?
+           GROUP BY r.runner_id ORDER BY total_j""",
+        (task["task_instance_id"],),
+    ).fetchall()
+    for r in rows:
+        passes = r["passes"] or 0
+        jps = f"{r['total_j']/passes:8.3f}" if passes else "     inf"
+        print(f"  {r['runner_id']:<14} runs={r['runs']:<3} pass={passes:<3} "
+              f"total={r['total_j']:8.3f} J  J/success={jps}")
+
+
+def demo_codefix():
+    import os
+    print("EDEN v0 demo — code-fix family (設計書 §8 domain)")
+    print("=" * 60)
+    print("\n[1/5] task create")
+    task_id = cmd_task_create(str(BASE / "tasks" / "codefix.json"))
+
+    print("\n[2/5] brute-force mutation search × 5 (burns joules instead of thinking)")
+    cmd_run(task_id, "codefix_brute", repeat=5)
+    cmd_calibrate(task_id, "codefix_brute")
+
+    print("\n[3/5] first record")
+    cmd_frontier(task_id)
+
+    print("\n[4/5] rule-based fix × 5 (knows the bug class)")
+    cmd_run(task_id, "codefix_rules", repeat=5)
+    cmd_frontier(task_id)
+
+    if shutil.which("ollama"):
+        model = os.environ.get("EDEN_LLM_MODEL", "qwen2.5:7b")
+        print(f"\n[5/5] local LLM runner × 2 (ollama {model}; warm-up run excluded)")
+        subprocess.run(["ollama", "run", model, "Reply with exactly: OK"],
+                       capture_output=True, text=True, timeout=600)
+        cmd_run(task_id, "codefix_llm", repeat=2)
+        cmd_frontier(task_id)
+    else:
+        print("\n[5/5] ollama not found — skipping LLM runner")
+
+    print("\nJoules per successful task (§8 primary metric):")
+    summary_jps(task_id)
+
+
+def cmd_demo():
+    print("EDEN v0 demo — 設計書 §7 scenario")
+    print("=" * 60)
+    print("\n[1/6] task create")
+    task_id = cmd_task_create(str(BASE / "tasks" / "topk_words.json"))
+
+    print("\n[2/6] repeatability: naive_count × 10 (run→measure→verify→receipt)")
+    cmd_run(task_id, "naive_count", repeat=10)
+
+    print("\n[3/6] measurement noise (EDEN's first research result is σ)")
+    cmd_calibrate(task_id, "naive_count")
+
+    print("\n[4/6] first record")
+    cmd_frontier(task_id)
+
+    print("\n[5/6] challenger: dict_loop × 5")
+    cmd_run(task_id, "dict_loop", repeat=5)
+    cmd_frontier(task_id)
+
+    print("\n[6/6] challenger: counter_fast × 5")
+    cmd_run(task_id, "counter_fast", repeat=5)
+    cmd_frontier(task_id)
+
+    print("\n[extra] failing runner: bad_topk × 1 (Constitution II check)")
+    cmd_run(task_id, "bad_topk", repeat=1)
+    conn = db()
+    n_receipts = conn.execute(
+        "SELECT COUNT(*) c FROM receipts WHERE family_id="
+        "(SELECT family_id FROM tasks WHERE task_instance_id=?)", (task_id,)
+    ).fetchone()["c"]
+    n_mints = conn.execute("SELECT COUNT(*) c FROM mints").fetchone()["c"]
+    print(f"\nledger: {n_receipts} receipts, {n_mints} simulated mints, db={DB_PATH.name}")
+
+
+# ------------------------------------------------------------------------ cli
+
+def main():
+    p = argparse.ArgumentParser(prog="eden", description="EDEN v0 CLI")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("init", help="create the SQLite ledger")
+
+    pt = sub.add_parser("task", help="task operations")
+    tsub = pt.add_subparsers(dest="task_cmd", required=True)
+    tc = tsub.add_parser("create", help="create task from spec json")
+    tc.add_argument("spec")
+    tsub.add_parser("list", help="list tasks")
+
+    pr = sub.add_parser("run", help="run a task with a runner (chains verify+receipt)")
+    pr.add_argument("--task", required=True)
+    pr.add_argument("--runner", required=True)
+    pr.add_argument("--repeat", type=int, default=1)
+    pr.add_argument("--meter", choices=sorted(METERS),
+                    help="measurement adapter (default: auto per runner)")
+    pr.add_argument("--no-chain", action="store_true",
+                    help="store run+measurement only (use verify/receipt manually)")
+
+    pv = sub.add_parser("verify", help="verify a stored run")
+    pv.add_argument("run_id")
+
+    prc = sub.add_parser("receipt", help="emit or show a receipt")
+    prc.add_argument("action", choices=["emit", "show"])
+    prc.add_argument("run_id")
+
+    pc = sub.add_parser("calibrate", help="σ report for runner×task receipts")
+    pc.add_argument("--task", required=True)
+    pc.add_argument("--runner", required=True)
+
+    pf = sub.add_parser("frontier", help="compute frontier, detect dominance")
+    pf.add_argument("--task", required=True)
+
+    pd = sub.add_parser("demo", help="full demo scenario on this machine")
+    pd.add_argument("--scenario", choices=["topk", "codefix"], default="topk")
+
+    prv = sub.add_parser("_refverify", help=argparse.SUPPRESS)
+    prv.add_argument("input_path")
+    prv.add_argument("k", type=int)
+
+    a = p.parse_args()
+    if a.cmd == "init":
+        db()
+        print(f"ledger ready: {DB_PATH}")
+    elif a.cmd == "task" and a.task_cmd == "create":
+        cmd_task_create(a.spec)
+    elif a.cmd == "task" and a.task_cmd == "list":
+        for r in db().execute("SELECT * FROM tasks"):
+            print(f"{r['task_instance_id']}  family={r['family_id']}  "
+                  f"{r['task_contract_version']}")
+    elif a.cmd == "run":
+        cmd_run(a.task, a.runner, a.repeat, chain=not a.no_chain, meter=a.meter)
+    elif a.cmd == "verify":
+        cmd_verify(a.run_id)
+    elif a.cmd == "receipt" and a.action == "emit":
+        cmd_receipt_emit(a.run_id)
+    elif a.cmd == "receipt" and a.action == "show":
+        cmd_receipt_show(a.run_id)
+    elif a.cmd == "calibrate":
+        cmd_calibrate(a.task, a.runner)
+    elif a.cmd == "frontier":
+        cmd_frontier(a.task)
+    elif a.cmd == "demo":
+        demo_codefix() if a.scenario == "codefix" else cmd_demo()
+    elif a.cmd == "_refverify":
+        words = Path(a.input_path).read_text().split()
+        print(canonical(reference_topk(words, a.k)))
+
+
+if __name__ == "__main__":
+    main()
