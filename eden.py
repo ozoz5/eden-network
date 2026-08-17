@@ -27,6 +27,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import Counter
 from datetime import datetime, timezone
@@ -172,8 +173,130 @@ class OllamaCpuAdapter(EstimatedCpuAdapter):
         return p
 
 
+class PowermetricsAdapter(MeasurementAdapter):
+    """Level V (OS counter): whole-package power via macOS powermetrics.
+
+    Samples combined CPU+GPU+ANE power during the run, with a pre-roll window
+    to estimate the idle baseline. Energy = (mean active power - mean idle
+    power) x child wall time. Captures GPU/ANE, closing the LLM blind spot of
+    cpu-time meters. Requires passwordless sudo for /usr/bin/powermetrics.
+
+    Termination note: the root-owned powermetrics process cannot be signalled
+    from a user process, so it writes to a pipe and exits on SIGPIPE when we
+    close the read end. A reader thread drains the pipe during the run.
+    """
+
+    PROFILE_ID = "powermetrics-package-v1"
+    METHOD = "os-counter"
+    ASSIGNED_CV = 0.10
+    CONFIDENCE = 0.7
+    BOUNDARY = ("system-package power (CPU+GPU+ANE) minus measured idle "
+                "baseline; exclusive use assumed")
+    INTERVAL_MS = 100
+    PREROLL_S = 0.5
+
+    def _reader(self):
+        try:
+            for line in self._proc.stdout:
+                if "Combined Power" in line:
+                    try:
+                        mw = float(line.rsplit(":", 1)[1].strip().split()[0])
+                        self._samples.append((time.monotonic(), mw))
+                    except (ValueError, IndexError):
+                        pass
+        except ValueError:
+            pass  # pipe closed by stop()
+
+    def start(self):
+        self._samples = []
+        self._proc = subprocess.Popen(
+            ["sudo", "-n", "/usr/bin/powermetrics", "-i",
+             str(self.INTERVAL_MS), "--samplers", "cpu_power"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
+        time.sleep(self.PREROLL_S)
+        if self._proc.poll() is not None:
+            sys.exit("error: powermetrics unavailable. Grant passwordless "
+                     "sudo:\n  echo \"$USER ALL=(ALL) NOPASSWD: "
+                     "/usr/bin/powermetrics\" | sudo tee "
+                     "/etc/sudoers.d/powermetrics")
+        ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+        self._c0 = ru.ru_utime + ru.ru_stime
+        self._t0 = time.monotonic()
+
+    def stop(self):
+        self._t_end = time.monotonic()
+        self._wall = self._t_end - self._t0
+        ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+        self._cpu = (ru.ru_utime + ru.ru_stime) - self._c0
+        time.sleep(self.INTERVAL_MS / 1000 * 1.5)  # let the last sample land
+        try:
+            self._proc.stdout.close()  # next write -> SIGPIPE -> exit
+        except OSError:
+            pass
+        try:
+            self._proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            pass
+        self._idle = [mw for t, mw in self._samples if t < self._t0]
+        self._active = [mw for t, mw in self._samples
+                        if self._t0 <= t <= self._t_end + self.INTERVAL_MS / 1000]
+        self._mean_idle = sum(self._idle) / len(self._idle) if self._idle else 0.0
+        self._mean_active = (sum(self._active) / len(self._active)
+                             if self._active else 0.0)
+        if self._active:
+            watts = max(0.0, self._mean_active - self._mean_idle) / 1000.0
+            self._energy = watts * self._wall
+            self._fallback = False
+        else:
+            # run shorter than the sampling interval: fall back to Level S
+            self._energy = self._cpu * EstimatedCpuAdapter.WATTS_PER_CPU_SECOND
+            self._fallback = True
+
+    def cpu_seconds(self): return self._cpu
+    def wall_seconds(self): return self._wall
+    def energy_joules(self): return self._energy
+    def confidence(self): return 0.4 if self._fallback else self.CONFIDENCE
+    def method(self): return "estimated" if self._fallback else self.METHOD
+
+    def profile(self) -> dict:
+        return {
+            "meter_profile_id": self.PROFILE_ID,
+            "method": self.method(),
+            "raw_observable": "powermetrics Combined Power (CPU+GPU+ANE) mW "
+                              f"@ {self.INTERVAL_MS}ms + child cpu_seconds",
+            "interval_ms": self.INTERVAL_MS,
+            "preroll_s": self.PREROLL_S,
+            "mean_active_mw": round(self._mean_active, 1),
+            "mean_idle_mw": round(self._mean_idle, 1),
+            "n_samples_active": len(self._active),
+            "n_samples_idle": len(self._idle),
+            "fallback_to_estimated": self._fallback,
+            "assigned_cv": self.ASSIGNED_CV,
+            "confidence": self.confidence(),
+        }
+
+
+def powermetrics_available() -> bool:
+    try:
+        r = subprocess.run(
+            ["sudo", "-n", "/usr/bin/powermetrics", "-n", "1", "-i", "50",
+             "--samplers", "cpu_power"],
+            capture_output=True, timeout=10,
+        )
+        return r.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 EstimatedCpuAdapter.BOUNDARY = None
-METERS = {"estimated": EstimatedCpuAdapter, "ollama": OllamaCpuAdapter}
+METERS = {
+    "estimated": EstimatedCpuAdapter,
+    "ollama": OllamaCpuAdapter,
+    "powermetrics": PowermetricsAdapter,
+}
 
 
 def run_measured(cmd: list, cwd=None, meter: str = "estimated") -> dict:
@@ -399,8 +522,13 @@ def cmd_run(task_prefix: str, runner: str, repeat: int, chain: bool = True,
         extra = [str(BASE / spec["test_file"]), spec["module_name"]]
     else:
         extra = [str(spec["k"])]
-    # LLM runners burn cpu inside the ollama daemon -> different meter needed.
-    meter = meter or ("ollama" if "llm" in runner else "estimated")
+    # LLM runners burn energy in the ollama daemon and on the GPU/ANE.
+    # Prefer the Level V package meter when available; else daemon-cpu Level S.
+    if meter is None:
+        if "llm" in runner:
+            meter = "powermetrics" if powermetrics_available() else "ollama"
+        else:
+            meter = "estimated"
 
     run_ids = []
     for i in range(repeat):

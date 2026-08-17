@@ -268,6 +268,21 @@ Independently verified
 - git公開: README.md（英語・公開入口）追加。eden.db / data/ は.gitignoreで除外（台帳はローカル観測データ）。
 - License未定 — 公開リポジトリのライセンス選定は本人判断待ち。
 
+### v0実装記録 追補2（2026-08-18 — Level V達成）
+
+- **PowermetricsAdapter実装**（powermetrics-package-v1、Level V / os-counter）:
+  CPU+GPU+ANEパッケージ電力を100ms間隔で採取し、アイドルベースライン（pre-roll 0.5s実測）を控除して積分。
+  root所有プロセスへはシグナル不可のため、pipe閉鎖→SIGPIPEで停止する設計。sudoers 1行（powermetrics限定NOPASSWD）で解禁。
+- **6.0 W仮定の初校正**: cpu-boundタスクの実測は約9.3 W/cpu秒相当。仮定は約1.55倍の過少だった。
+  旧レシートは生cpu秒を保持しているため再導出可能（憲法IVの実務初仕事）。
+- **GPU盲点の定量化**: LLM推論の実エネルギーは57〜159 J/回（推論中パッケージ30.4 W vs アイドル3.7 W）。
+  cpu-time計測の見かけ2.4 Jに対し**25〜65倍**の過少だった。計測レベルを上げたら物語が2桁変わった —
+  Receiptが計測プロファイルとconfidenceを持つ設計思想（§6計測レベル）の実証。
+- 実測J/success（code-fix family）: rules 0.343 / brute 1.538 / LLM 57〜159（同じ検証済み成果に約200〜450倍差）。
+- 既知のデータ品質注意: codefix_llm群には旧計測（下限値）と新計測（Level V）のレシートが混在。
+  群の平均は混在分だけ歪む。Receipt自体はどちらも正しい観測（計測プロファイル明記）であり、meter別の層別集計で解決する。
+- 次: §9実験（実タスク群 × ローカルLLM複数 × 戦略比較）の実施が解禁された。
+
 ---
 
 ## 8. 検証済みの外部事実（2026-08-16時点の調査）

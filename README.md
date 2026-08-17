@@ -60,10 +60,14 @@ minimum certifiable single-run improvement at 2σ: 0.074 J
 Code-fix family, joules per successful task (all runs, including failures):
 
 ```text
-codefix_rules  (targeted fix)      0.343 J/success   ← frontier
-codefix_brute  (mutation search)   1.538 J/success
-codefix_llm    (qwen2.5:7b, 3/3)  ≥2.44 J/success   (lower bound, see below)
+codefix_rules  (targeted fix)       0.343 J/success   ← frontier
+codefix_brute  (mutation search)    1.538 J/success
+codefix_llm    (qwen2.5:7b, 5/5)   57–159 J per fix   (Level V, GPU included)
 ```
+
+The LLM fixes the bug reliably — at roughly 200–450× the energy of the
+rule-based fix for the same verified result. Intelligence hierarchies are
+visible in joules.
 
 Notable observed behaviors:
 
@@ -76,12 +80,26 @@ Notable observed behaviors:
 
 ### Measurement honesty
 
-v0 measures at Level S (estimated): child-process cpu-seconds × a declared,
-assumed watts constant. Raw cpu-seconds are stored in every receipt, so joules
-can be re-derived when better meters exist (Constitution IV). Known and
-declared blind spot: GPU/ANE inference energy (e.g. ollama on Apple Silicon)
-is not captured by cpu-time sampling — those joules are recorded as lower
-bounds, with the limitation written into the receipt's measurement profile.
+Two meter levels are implemented, and every receipt stores its raw
+observables so joules can be re-derived later (Constitution IV):
+
+- **Level S (estimated)**: child-process cpu-seconds × a declared, assumed
+  watts constant. Blind to GPU/ANE — LLM joules recorded under this meter are
+  labeled lower bounds inside the receipt.
+- **Level V (os-counter)**: macOS `powermetrics` package power (CPU+GPU+ANE)
+  sampled during the run, minus a measured idle baseline. Requires one-time
+  passwordless sudo for `/usr/bin/powermetrics`:
+
+  ```bash
+  echo "$USER ALL=(ALL) NOPASSWD: /usr/bin/powermetrics" | sudo tee /etc/sudoers.d/powermetrics
+  ```
+
+Calibration findings on this machine: the assumed 6.0 W/cpu-s under-reports
+package power (~9.3 W/cpu-s measured for a cpu-bound task), and cpu-time
+metering under-reported LLM inference energy by **25–65×** (2.4 J apparent →
+57–159 J measured). Upgrading the meter changed the story by two orders of
+magnitude — which is exactly why receipts carry measurement profiles and
+confidence instead of bare numbers.
 
 ## Specification
 
