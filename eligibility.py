@@ -157,8 +157,12 @@ def dominates(a, b) -> bool:
 
 
 def pareto_frontier(certs) -> list:
-    return [c for c in certs
-            if not any(dominates(o, c) for o in certs if o is not c)]
+    """Non-dominated certs. A cert with zero successes has no J/success and
+    can hold no record — it is excluded from membership (audit cosmetic fix:
+    an empty meter stratum must not exhibit an 'infinite' frontier)."""
+    live = [c for c in certs if c["successes"] > 0]
+    return [c for c in live
+            if not any(dominates(o, c) for o in live if o is not c)]
 
 
 def assess_cert_insertion(existing_certs, new_cert) -> dict:

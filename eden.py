@@ -37,6 +37,7 @@ from pathlib import Path
 
 import challenge as challenge_mod
 import eligibility
+import ore as ore_mod
 
 BASE = Path(__file__).resolve().parent
 DB_PATH = BASE / "eden.db"
@@ -457,6 +458,14 @@ CREATE TABLE IF NOT EXISTS epoch_runs(
   run_id TEXT PRIMARY KEY,
   instance_index INTEGER NOT NULL,
   runner_id TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ores(
+  ore_hash TEXT PRIMARY KEY,
+  receipt_id TEXT NOT NULL,
+  epoch_id TEXT NOT NULL,
+  zero_bits INTEGER NOT NULL,
+  tier TEXT NOT NULL,
+  discovered_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS distribution_certs(
   cert_id TEXT PRIMARY KEY,
@@ -1391,6 +1400,60 @@ def cmd_challenge_frontier(family_prefix: str):
               f"J/success {jps}")
 
 
+def cmd_ore_scan():
+    """Seal receipts with the first epoch opened after them; keep the rare.
+
+    Deterministic and replayable from the ledger. ORE never touches CREDIT
+    (spec 6.7): this function reads receipts and epochs, writes ores, and
+    nothing else.
+    """
+    conn = db()
+    epochs = conn.execute(
+        "SELECT epoch_id, seed, created_at FROM epochs ORDER BY created_at"
+    ).fetchall()
+    receipts = conn.execute(
+        "SELECT receipt_id, receipt_hash, created_at FROM receipts "
+        "ORDER BY created_at").fetchall()
+    scanned = found = pending = 0
+    for r in receipts:
+        sealer = next((e for e in epochs if e["created_at"] > r["created_at"]),
+                      None)
+        if sealer is None:
+            pending += 1
+            continue
+        scanned += 1
+        h, z, tier = ore_mod.discover(r["receipt_hash"], sealer["seed"])
+        if tier is None:
+            continue
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO ores VALUES (?,?,?,?,?,?)",
+            (h, r["receipt_id"], sealer["epoch_id"], z, tier, now_iso()))
+        found += cur.rowcount
+    conn.commit()
+    print(f"scanned {scanned} sealed receipts ({pending} await a sealing epoch)")
+    total = conn.execute("SELECT COUNT(*) c FROM ores").fetchone()["c"]
+    print(f"new ores: {found}  (ledger total: {total})")
+
+
+def cmd_ore_list():
+    conn = db()
+    rows = conn.execute(
+        "SELECT o.*, r.receipt_json FROM ores o "
+        "JOIN receipts r ON r.receipt_id = o.receipt_id "
+        "ORDER BY o.zero_bits DESC, o.discovered_at").fetchall()
+    if not rows:
+        print("no ores discovered yet")
+        return
+    for o in rows:
+        rec = json.loads(o["receipt_json"])
+        odds = 2 ** o["zero_bits"]
+        print(f"  ORE: {o['tier']:<6} rarity ~1/{odds:<8} "
+              f"hash {o['ore_hash'][:16]}…")
+        print(f"       origin: {rec['runner_id']} on family "
+              f"{rec['family_id']}  ({rec['run_energy']['energy_joules']:.3f} J)"
+              f"  sealed by epoch {o['epoch_id'][:8]}")
+
+
 # ------------------------------------------------------------------------ cli
 
 def main():
@@ -1423,6 +1486,12 @@ def main():
 
     pim = sub.add_parser("import", help="import foreign receipts (unsigned claims)")
     pim.add_argument("path")
+
+    por = sub.add_parser("ore", help="the cultural layer (v1 spec 13)")
+    por.add_argument("action", choices=["scan", "list"])
+
+    ph = sub.add_parser("html", help="render the ledger as a single page")
+    ph.add_argument("--output", default="eden_ledger.html")
 
     pc = sub.add_parser("calibrate", help="σ report for runner×task receipts")
     pc.add_argument("--task", required=True)
@@ -1480,6 +1549,15 @@ def main():
         cmd_receipt_show(a.run_id)
     elif a.cmd == "import":
         cmd_import(a.path)
+    elif a.cmd == "ore" and a.action == "scan":
+        cmd_ore_scan()
+    elif a.cmd == "ore" and a.action == "list":
+        cmd_ore_list()
+    elif a.cmd == "html":
+        import ledger_html
+        out = Path(a.output)
+        out.write_text(ledger_html.build_html(db()))
+        print(f"ledger page: {out.resolve()}")
     elif a.cmd == "calibrate":
         cmd_calibrate(a.task, a.runner)
     elif a.cmd == "frontier":

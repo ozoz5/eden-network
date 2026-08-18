@@ -143,6 +143,15 @@ class TestDistributionCerts(unittest.TestCase):
         v2 = eligibility.assess_cert_insertion([zero], a)
         self.assertFalse(v2["mintable"])  # dominating an inf cert prices nothing
 
+    def test_zero_success_certs_hold_no_record(self):
+        # Audit cosmetic fix: an empty meter stratum must not exhibit an
+        # "infinite" frontier — 0-success certs are not frontier members.
+        zero = eligibility.distribution_cert("e"*16, "f", "Z", "h", "m", 6, 6, 0, 1.0, 0.0)
+        self.assertEqual(eligibility.pareto_frontier([zero]), [])
+        ok = eligibility.distribution_cert("e"*16, "f", "A", "h", "m", 6, 6, 6, 6.0, 0.0)
+        front = eligibility.pareto_frontier([zero, ok])
+        self.assertEqual([c["runner"] for c in front], ["A"])
+
     def test_small_epoch_not_eligible(self):
         small = eligibility.distribution_cert("e"*16, "f", "A", "h", "m", 3, 3, 3, 3.0, 0.0)
         self.assertFalse(eligibility.assess_cert_insertion([], small)["eligible"])
