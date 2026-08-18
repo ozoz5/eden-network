@@ -72,6 +72,41 @@ class TestInjectBug(unittest.TestCase):
         self.assertGreaterEqual(len(descs), 2)
 
 
+class TestSemanticBugs(unittest.TestCase):
+    def test_semantic_injection_breaks_tests_and_is_deterministic(self):
+        base = Path(__file__).resolve().parent.parent
+        correct = (base / "tasks" / "codefix" / "correct_stats.py").read_text()
+        tp = base / "tasks" / "codefix" / "test_stats2.py"
+        m1, d1 = challenge.inject_semantic_bug(correct, "ab" * 32, tp, "stats")
+        m2, d2 = challenge.inject_semantic_bug(correct, "ab" * 32, tp, "stats")
+        self.assertEqual((m1, d1), (m2, d2))
+        self.assertTrue(d1.startswith("sem:"))
+        self.assertTrue(challenge._tests_fail(m1, tp, "stats"))
+
+    def test_semantic_bugs_are_outside_token_space(self):
+        # No single BUG_OPS substitution may turn the buggy fragment back
+        # into the correct one — the definition of search-defeating.
+        for correct_frag, buggy_frag in challenge.SEMANTIC_BUGS:
+            for a, b in challenge.BUG_OPS:
+                start = 0
+                while True:
+                    i = buggy_frag.find(a, start)
+                    if i < 0:
+                        break
+                    mutated = buggy_frag[:i] + b + buggy_frag[i + len(a):]
+                    start = i + 1
+                    self.assertNotEqual(
+                        mutated, correct_frag,
+                        f"{buggy_frag!r} is single-token reversible via "
+                        f"({a!r}->{b!r})")
+
+    def test_all_semantic_fragments_exist_in_substrate(self):
+        base = Path(__file__).resolve().parent.parent
+        correct = (base / "tasks" / "codefix" / "correct_stats.py").read_text()
+        for correct_frag, _ in challenge.SEMANTIC_BUGS:
+            self.assertIn(correct_frag, correct)
+
+
 class TestEnrollment(unittest.TestCase):
     def test_exact_hash_required(self):
         self.assertTrue(challenge.check_enrollment("abc123", "abc123"))

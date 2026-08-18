@@ -1161,7 +1161,8 @@ def cmd_challenge_open(gen_spec_path: str, runners: list, n: int):
         # issued bug, derive follow-up seeds by a fixed, auditable rule.
         for attempt in range(16):
             inst_seed = sha(seed + str(i) + ":" + str(attempt))
-            mutant, bug = challenge_mod.inject_bug(
+            mutant, bug = challenge_mod.inject(
+                spec.get("bug_mode", "token"),
                 correct, inst_seed, test_path, spec["module_name"])
             if bug not in used:
                 break

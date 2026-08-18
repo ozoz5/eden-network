@@ -182,7 +182,31 @@ attempts cost 3× for the same 5/12.
 Declared bias, as always: the bug vocabulary is a subset of the searcher's
 mutation vocabulary, so the cascade resolved everything in its cheap stages
 (its LLM stages never fired). On a distribution that defeats search, these
-numbers will look different — that experiment is next.
+numbers will look different — so we built that distribution next.
+
+### The frontier inverted (epoch f7f0863a, semantic bugs)
+
+Six semantic bug classes — population-vs-sample variance, unsorted median,
+inverted mean, and friends — each **proven by test to be irreversible by any
+single-token substitution**. Same seven strategies, same rules:
+
+```text
+strategy        success   J/success     (previous, token bugs)
+phi4 14b         11/12    221   ← took the crown        (11/12, 287)
+cascade           6/12    299   ← dominated by phi4     (12/12, 1.37 — was champion)
+qwen2.5:1.5b      4/12    111   ← still cheapest/success (6/12, 81)
+qwen2.5:7b        3/12    617                            (5/12, 391)
+7b × 3 retries    3/12    742                            (5/12, 404)
+brute search      0/12    ∞     ← extinct, as proven    (12/12, 1.53)
+```
+
+**The frontier is a property of the distribution, not of the strategy.**
+Yesterday's champion is today's dominated entry; search went extinct on
+schedule; the 1.5b kept the price-per-success crown on both distributions
+and Pareto-dominated its own 7b sibling twice in a row; retries bought
+nothing either time (systematic failures stay systematic). "Which
+intelligence is efficient" has no distribution-free answer — and EDEN can
+now measure that inversion in joules, with receipts, both ways.
 
 ## First independent replication (two nodes)
 

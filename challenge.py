@@ -32,6 +32,20 @@ BUG_OPS = [
     (">", ">="), (">=", ">"), ("==", "!="), ("// 2", "// 2 - 1"),
 ]
 
+# Semantic bug classes (code-fix/3): (correct_fragment, buggy_fragment).
+# Each is chosen so that NO single-token substitution from BUG_OPS can undo
+# it — the search-defeating distribution. Restoring these requires knowing
+# what the code means (sample vs population variance, sorting before median,
+# accumulating vs overwriting), not just flipping operators.
+SEMANTIC_BUGS = [
+    ("acc / (len(values) - 1)", "acc / len(values)"),       # population var
+    ("s = sorted(values)", "s = list(values)"),             # median w/o sort
+    ("return total / len(values)", "return len(values) / total"),  # inverted
+    ("return s[mid]", "return s[mid - 1]"),                 # odd-median index
+    ("d = v - m", "d = v"),                                 # uncentered var
+    ("total = total + v", "total = v"),                     # last-value mean
+]
+
 
 def derive_epoch_seed(family_id: str, epoch_no: int, receipt_hashes) -> str:
     """Seed = H(family | epoch | recent ledger receipts). Recomputable."""
@@ -78,6 +92,33 @@ def inject_bug(correct_source: str, seed_hex: str, test_path,
         if _tests_fail(mutant, test_path, module_name):
             return mutant, f"{a}->{b}@{i}"
     raise RuntimeError(f"no valid bug injection for seed {seed_hex[:16]}")
+
+
+def inject_semantic_bug(correct_source: str, seed_hex: str, test_path,
+                        module_name: str):
+    """Seeded choice among semantic mutations that compile and break tests."""
+    rng = random.Random(int(seed_hex[:16], 16))
+    candidates = [p for p in SEMANTIC_BUGS if p[0] in correct_source]
+    rng.shuffle(candidates)
+    for correct_frag, buggy_frag in candidates:
+        mutant = correct_source.replace(correct_frag, buggy_frag, 1)
+        if mutant == correct_source:
+            continue
+        try:
+            compile(mutant, "<mutant>", "exec")
+        except SyntaxError:
+            continue
+        if _tests_fail(mutant, test_path, module_name):
+            return mutant, f"sem:{correct_frag[:20]}=>{buggy_frag[:20]}"
+    raise RuntimeError(f"no valid semantic injection for seed {seed_hex[:16]}")
+
+
+def inject(mode: str, correct_source: str, seed_hex: str, test_path,
+           module_name: str):
+    if mode == "semantic":
+        return inject_semantic_bug(correct_source, seed_hex, test_path,
+                                   module_name)
+    return inject_bug(correct_source, seed_hex, test_path, module_name)
 
 
 def check_enrollment(committed_hash: str, current_hash: str) -> bool:

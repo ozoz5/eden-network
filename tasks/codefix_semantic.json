@@ -1,0 +1,15 @@
+{
+  "task_contract_version": "code-fix/3",
+  "task_type": "code-fix",
+  "bug_mode": "semantic",
+  "title": "Fix one injected SEMANTIC bug in stats.py so all 16 tests pass",
+  "module_name": "stats",
+  "correct_source": "tasks/codefix/correct_stats.py",
+  "test_file": "tasks/codefix/test_stats2.py",
+  "tests_total": 16,
+  "quality": {
+    "type": "tests-pass"
+  },
+  "input_schema": "python-source",
+  "resource_boundary_profile": "single-process/child-cpu/incl-interpreter-startup"
+}
