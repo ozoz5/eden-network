@@ -84,6 +84,110 @@ def assess_record(group) -> dict:
             "pending": list(PENDING_CHECKS)}
 
 
+MIN_INSTANCES = 5   # distribution certificates need a minimal epoch size
+Z_95 = 1.96
+
+
+def wilson_interval(successes: int, attempts: int, z: float = Z_95):
+    """95% interval for a success rate; honest about small n."""
+    if attempts == 0:
+        return (0.0, 1.0)
+    p = successes / attempts
+    denom = 1 + z * z / attempts
+    center = (p + z * z / (2 * attempts)) / denom
+    half = z * ((p * (1 - p) / attempts
+                 + z * z / (4 * attempts * attempts)) ** 0.5) / denom
+    return (max(0.0, center - half), min(1.0, center + half))
+
+
+def distribution_cert(epoch_id, family_id, runner, code_hash, meter,
+                      n_instances, attempts, successes, run_j, verify_j):
+    """The frontier's input unit for challenge families (v0.3):
+    not "solved one instance cheaply" but "processed the issued distribution
+    at success rate q for X J per success". Verification energy is inside
+    the cost (Constitution III is structural, not a deduction step)."""
+    total = run_j + verify_j
+    rate = successes / attempts if attempts else 0.0
+    jps = (total / successes) if successes else float("inf")
+    lo, hi = wilson_interval(successes, attempts)
+    return {
+        "cert_id": f"{epoch_id[:8]}:{runner}#{code_hash[:6]}@{meter}",
+        "epoch_id": epoch_id, "family_id": family_id,
+        "runner": runner, "code_hash": code_hash, "meter": meter,
+        "n_instances": n_instances, "attempts": attempts,
+        "successes": successes, "success_rate": rate,
+        "rate_ci95": [lo, hi],
+        "run_j": run_j, "verify_j": verify_j, "total_j": total,
+        "j_per_success": jps,
+    }
+
+
+def cert_eligible(cert) -> dict:
+    reasons = []
+    if cert["n_instances"] < MIN_INSTANCES:
+        reasons.append(f"epoch too small: {cert['n_instances']} < {MIN_INSTANCES}")
+    if cert["attempts"] < cert["n_instances"]:
+        reasons.append("incomplete: fewer attempts than issued instances")
+    return {"eligible": not reasons, "reasons": reasons,
+            "pending": list(PENDING_CHECKS)}
+
+
+def dominates(a, b) -> bool:
+    """Pareto dominance on (success_rate up, J/success down), same meter only."""
+    if a["meter"] != b["meter"]:
+        return False
+    ge = (a["success_rate"] >= b["success_rate"]
+          and a["j_per_success"] <= b["j_per_success"])
+    strict = (a["success_rate"] > b["success_rate"]
+              or a["j_per_success"] < b["j_per_success"])
+    return ge and strict
+
+
+def pareto_frontier(certs) -> list:
+    return [c for c in certs
+            if not any(dominates(o, c) for o in certs if o is not c)]
+
+
+def assess_cert_insertion(existing_certs, new_cert) -> dict:
+    """Issuance rule for distribution certs: minting happens at cert
+    registration, as a pure function of ledger order (replayable).
+
+    Mint iff the new cert Pareto-dominates a previously non-dominated cert
+    with a finite J/success, and the family's verification cost does not
+    exceed its run cost (rho gate). Gain = J/success improvement over the
+    best dominated frontier cert (1 CREDIT = 1 J-per-success improvement,
+    v0 provisional)."""
+    rep = cert_eligible(new_cert)
+    if not rep["eligible"]:
+        return {"eligible": False, "reasons": rep["reasons"], "gain": 0.0,
+                "mintable": False, "mint_reasons": [],
+                "dominated": [], "pending": rep["pending"]}
+    prior_frontier = pareto_frontier(existing_certs)
+    dominated = [c for c in prior_frontier if dominates(new_cert, c)]
+    mint_reasons = []
+    finite = [c for c in dominated
+              if c["j_per_success"] != float("inf")]
+    if not dominated:
+        mint_reasons.append("no prior frontier cert dominated (genesis or "
+                            "non-dominating entry)")
+    elif not finite:
+        mint_reasons.append("dominated certs have no finite J/success — "
+                            "no measurable improvement to price")
+    if new_cert["run_j"] > 0 and new_cert["verify_j"] / new_cert["run_j"] > RHO_MAX:
+        mint_reasons.append(
+            f"rho={new_cert['verify_j']/new_cert['run_j']:.2f} > {RHO_MAX:g} "
+            "— verification costs more than the runs (spec §5)")
+    gain = 0.0
+    if not mint_reasons:
+        gain = max(c["j_per_success"] for c in finite) - new_cert["j_per_success"]
+        if gain <= 0:
+            mint_reasons.append("no positive J/success improvement")
+            gain = 0.0
+    return {"eligible": True, "reasons": [], "gain": gain,
+            "mintable": not mint_reasons, "mint_reasons": mint_reasons,
+            "dominated": dominated, "pending": rep["pending"]}
+
+
 def assess_transition(holder, candidate) -> dict:
     """May candidate take the frontier from holder — and does it mint?
 

@@ -458,6 +458,25 @@ CREATE TABLE IF NOT EXISTS epoch_runs(
   instance_index INTEGER NOT NULL,
   runner_id TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS distribution_certs(
+  cert_id TEXT PRIMARY KEY,
+  epoch_id TEXT NOT NULL,
+  family_id TEXT NOT NULL,
+  runner_id TEXT NOT NULL,
+  runner_code_hash TEXT NOT NULL,
+  meter TEXT NOT NULL,
+  n_instances INTEGER NOT NULL,
+  attempts INTEGER NOT NULL,
+  successes INTEGER NOT NULL,
+  success_rate REAL NOT NULL,
+  rate_lo REAL NOT NULL,
+  rate_hi REAL NOT NULL,
+  run_j REAL NOT NULL,
+  verify_j REAL NOT NULL,
+  total_j REAL NOT NULL,
+  j_per_success REAL,
+  created_at TEXT NOT NULL
+);
 """
 
 
@@ -1213,6 +1232,135 @@ def cmd_challenge_report(epoch_prefix: str):
               f"total={r['total_j']:9.3f} J  J/success={jps}")
 
 
+def _cert_row_to_dict(row) -> dict:
+    return {
+        "cert_id": row["cert_id"], "epoch_id": row["epoch_id"],
+        "family_id": row["family_id"], "runner": row["runner_id"],
+        "code_hash": row["runner_code_hash"], "meter": row["meter"],
+        "n_instances": row["n_instances"], "attempts": row["attempts"],
+        "successes": row["successes"], "success_rate": row["success_rate"],
+        "rate_ci95": [row["rate_lo"], row["rate_hi"]],
+        "run_j": row["run_j"], "verify_j": row["verify_j"],
+        "total_j": row["total_j"],
+        "j_per_success": (row["j_per_success"] if row["j_per_success"]
+                          is not None else float("inf")),
+    }
+
+
+def cmd_challenge_certify(epoch_prefix: str, commit: bool = False):
+    """Fold an epoch's runs into Distribution Certificates (v0.3): the
+    frontier's input unit for challenge families. Minting happens here, at
+    cert registration, as a pure function of ledger order."""
+    conn = db()
+    epoch = conn.execute("SELECT * FROM epochs WHERE epoch_id LIKE ?",
+                         (epoch_prefix + "%",)).fetchone()
+    if epoch is None:
+        sys.exit(f"error: no epoch matching '{epoch_prefix}'")
+    eid, fam = epoch["epoch_id"], epoch["family_id"]
+    aggs = conn.execute(
+        """SELECT er.runner_id, r.runner_code_hash,
+                  json_extract(m.meter_profile_json, '$.meter_profile_id') AS meter,
+                  COUNT(*) AS attempts,
+                  SUM(CASE WHEN v.status='PASS' THEN 1 ELSE 0 END) AS successes,
+                  SUM(m.energy_joules) AS run_j,
+                  SUM(COALESCE(v.verify_energy_joules, 0)) AS verify_j
+           FROM epoch_runs er
+           JOIN runs r ON r.run_id = er.run_id
+           JOIN measurements m ON m.run_id = er.run_id
+           LEFT JOIN verifications v ON v.run_id = er.run_id
+           WHERE er.epoch_id=?
+           GROUP BY er.runner_id, r.runner_code_hash, meter""",
+        (eid,)).fetchall()
+    if not aggs:
+        sys.exit(f"error: epoch {eid} has no runs (run: eden challenge run)")
+
+    existing = [_cert_row_to_dict(r) for r in conn.execute(
+        "SELECT * FROM distribution_certs WHERE family_id=? ORDER BY created_at",
+        (fam,))]
+    print(f"epoch {eid}  family={fam}  certifying {len(aggs)} runner strata")
+    for a in aggs:
+        cert = eligibility.distribution_cert(
+            eid, fam, a["runner_id"], a["runner_code_hash"], a["meter"],
+            epoch["n_instances"], a["attempts"], a["successes"] or 0,
+            a["run_j"], a["verify_j"])
+        verdict = eligibility.assess_cert_insertion(existing, cert)
+        jps = ("inf" if cert["j_per_success"] == float("inf")
+               else f"{cert['j_per_success']:.3f}")
+        print(f"\n  {cert['cert_id']}")
+        print(f"    success {cert['successes']}/{cert['attempts']} "
+              f"(rate {cert['success_rate']*100:.0f}%, "
+              f"ci95 [{cert['rate_ci95'][0]*100:.0f}%, "
+              f"{cert['rate_ci95'][1]*100:.0f}%])  "
+              f"total {cert['total_j']:.3f} J (verify incl.)  "
+              f"J/success {jps}")
+        if not verdict["eligible"]:
+            print("    NOT ELIGIBLE: " + "; ".join(verdict["reasons"]))
+            continue
+        if verdict["mintable"]:
+            doms = ", ".join(c["cert_id"] for c in verdict["dominated"])
+            print(f"    DOMINATES [{doms}]")
+            print(f"    MINT (simulated): +{verdict['gain']:.3f} CREDIT "
+                  "(1 CREDIT = 1 J-per-success improvement, v0 provisional)")
+        else:
+            print("    no mint: " + "; ".join(verdict["mint_reasons"]))
+        print("    pending (unenforced): " + ", ".join(verdict["pending"]))
+        if commit:
+            jps_val = (None if cert["j_per_success"] == float("inf")
+                       else cert["j_per_success"])
+            conn.execute(
+                "INSERT OR IGNORE INTO distribution_certs VALUES "
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (cert["cert_id"], eid, fam, cert["runner"], cert["code_hash"],
+                 cert["meter"], cert["n_instances"], cert["attempts"],
+                 cert["successes"], cert["success_rate"],
+                 cert["rate_ci95"][0], cert["rate_ci95"][1],
+                 cert["run_j"], cert["verify_j"], cert["total_j"],
+                 jps_val, now_iso()))
+            if verdict["mintable"]:
+                already = conn.execute(
+                    "SELECT 1 FROM mints WHERE family_id=? AND new_group=?",
+                    (fam, cert["cert_id"])).fetchone()
+                if already is None:
+                    worst = max(c["j_per_success"] for c in verdict["dominated"]
+                                if c["j_per_success"] != float("inf"))
+                    conn.execute(
+                        "INSERT INTO mints(family_id, prev_group, new_group, "
+                        "prev_low_j, new_high_j, verify_energy_j, "
+                        "certified_gain_j, note, created_at) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)",
+                        (fam, verdict["dominated"][0]["cert_id"],
+                         cert["cert_id"], worst, cert["j_per_success"],
+                         cert["verify_j"], verdict["gain"],
+                         "SIMULATED-DIST", now_iso()))
+            conn.commit()
+            existing.append(cert)
+    if not commit:
+        print("\n  (analysis only — rerun with --commit to register certs/mints)")
+
+
+def cmd_challenge_frontier(family_prefix: str):
+    """Read-only: the current Pareto frontier of distribution certs."""
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM distribution_certs WHERE family_id LIKE ? "
+        "ORDER BY created_at", (family_prefix + "%",)).fetchall()
+    if not rows:
+        sys.exit(f"error: no distribution certs for family '{family_prefix}' "
+                 "(run: eden challenge certify <epoch> --commit)")
+    certs = [_cert_row_to_dict(r) for r in rows]
+    frontier = eligibility.pareto_frontier(certs)
+    fam = certs[0]["family_id"]
+    print(f"family {fam}  distribution Pareto frontier "
+          f"(success rate ↑, J/success ↓, per meter):")
+    for c in sorted(certs, key=lambda c: (c["meter"], -c["success_rate"])):
+        mark = "★" if c in frontier else " "
+        jps = ("inf" if c["j_per_success"] == float("inf")
+               else f"{c['j_per_success']:9.3f}")
+        print(f"  {mark} {c['cert_id']:<44} rate {c['success_rate']*100:3.0f}% "
+              f"[{c['rate_ci95'][0]*100:3.0f},{c['rate_ci95'][1]*100:3.0f}]  "
+              f"J/success {jps}")
+
+
 # ------------------------------------------------------------------------ cli
 
 def main():
@@ -1266,6 +1414,14 @@ def main():
     cr.add_argument("epoch")
     cp = csub.add_parser("report", help="expected-J report over the epoch")
     cp.add_argument("epoch")
+    cc = csub.add_parser("certify",
+                         help="fold an epoch into distribution certs (mints)")
+    cc.add_argument("epoch")
+    cc.add_argument("--commit", action="store_true",
+                    help="register certs and mint (default: analysis only)")
+    cf = csub.add_parser("frontier",
+                         help="Pareto frontier of distribution certs")
+    cf.add_argument("family")
 
     prv = sub.add_parser("_refverify", help=argparse.SUPPRESS)
     prv.add_argument("input_path")
@@ -1301,6 +1457,10 @@ def main():
         cmd_challenge_run(a.epoch)
     elif a.cmd == "challenge" and a.ch_cmd == "report":
         cmd_challenge_report(a.epoch)
+    elif a.cmd == "challenge" and a.ch_cmd == "certify":
+        cmd_challenge_certify(a.epoch, commit=a.commit)
+    elif a.cmd == "challenge" and a.ch_cmd == "frontier":
+        cmd_challenge_frontier(a.family)
     elif a.cmd == "_refverify":
         words = Path(a.input_path).read_text().split()
         print(canonical(reference_topk(words, a.k)))

@@ -402,6 +402,35 @@ codefix_llm    1/6 ( 17%)  total 893.9 J  → 894 J/success    [Level V]
 **ハーネス検証**: 失敗したinstance 2の手動再現はPASS（確率的失敗）、instance 0/4は再試行でもFAIL
 （クラス依存の実力）。5/6失敗はハーネス欠陥ではなくモデルの実測。
 
+### v0実装記録 追補7（2026-08-18 — v0.3: Distribution CertificateとPareto前線）
+
+challenge epochの集約結果を前線の正式な入力単位にした（GPTレビュー第2弾の中心提案の採用）。
+世界記録の定義が変わる: 「この問題を0.3 Jで解いた」ではなく
+**「プロトコル配布の分布Dを、成功率qで、成功1件あたりX Jで処理した」**。
+
+**実装（テスト38本）:**
+- `Distribution Certificate`（distribution_certsテーブル）: epoch × runner × meterの集約 —
+  成功率（Wilson 95%区間付き）、総エネルギー、J/success。**検証エネルギーはcertのコストに内蔵**
+  （憲法IIIは控除ステップではなく構造になった）
+- **前線は(成功率↑, J/success↓)の2次元Pareto**（meter層別）。設計書§3の「Quality × Resource Pareto前線」が
+  1次元退化を脱して本来の形になった。GPTの例（A:100%/20J、B:95%/10J、C:60%/2Jが共存し、
+  D:96%/8JがBだけを支配する）はテストで固定済み
+- **mintはcert登録時に台帳順序の純関数として発生**（監査指摘G「発行が照会タイミングの関数」への解答、
+  challenge familyについては解決）。genesisはmintなし。無限J/success（成功0）のcertを支配しても
+  価格付け不能でmintなし。単位は「J/success改善1につき1 CREDIT」（v0仮）
+- MIN_INSTANCES=5未満のepochはcert不適格。失敗runのエネルギーはcertに全額算入され、
+  **監査指摘C（憲法II×III衝突: 失敗コストの発行会計漏れ）はchallenge familyについて構造的に解消**
+
+**初回の分布前線（実データ）:**
+```text
+★ brute  rate 100% [61,100]  1.590 J/success   ← estimated層の前線
+  rules  rate   0% [ 0, 39]  ∞
+★ llm    rate  17% [ 3, 56]  894.004 J/success  ← powermetrics層（単独genesis）
+```
+
+残る構造課題: 1D前線（非challenge family）とdist前線の併存はv0.4で統合判断。
+区間考慮のPareto支配（ci95重複時の保留）は未実装（pendingに追加すべき）。
+
 ---
 
 ## 8. 検証済みの外部事実（2026-08-16時点の調査）

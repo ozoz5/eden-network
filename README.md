@@ -138,6 +138,22 @@ search. The honest claim is "search dominates single-token bug
 distributions", not "search beats LLMs". Harness validated: one failed
 instance passed on manual replay (stochastic), two failed again (real).
 
+**v0.3 — the frontier's input unit is now the distribution.** An epoch folds
+into a Distribution Certificate (success rate with a Wilson 95% interval,
+total joules with verification *inside* the cost, J/success), and the record
+is a **Pareto frontier over (success rate ↑, J/success ↓)** per meter — a
+100%/20J runner, a 95%/10J runner and a 60%/2J runner can all hold the record
+at once; a 96%/8J newcomer dominates only the middle one. Minting happens at
+certificate registration as a pure function of ledger order — a runner that
+solves one instance miraculously cheaply cannot escape the cost of its other
+five failures:
+
+```text
+★ brute  rate 100% [61,100]   1.59 J/success   ← frontier (estimated meter)
+  rules  rate   0% [ 0, 39]   ∞                (dominated)
+★ llm    rate  17% [ 3, 56]   894 J/success    ← frontier (Level V meter, genesis)
+```
+
 ## Measurement honesty
 
 Every condition that decides whether a receipt group may hold a record or

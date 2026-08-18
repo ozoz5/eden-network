@@ -82,5 +82,71 @@ class TestTransition(unittest.TestCase):
         self.assertFalse(v["certifiable"])
 
 
+def _cert(runner="r", meter="m", rate_k=5, n=6, jps=10.0, verify=0.5):
+    successes = rate_k
+    run_j = jps * successes - verify if successes else 1.0
+    return eligibility.distribution_cert(
+        "e" * 16, "fam", runner, "cafe01", meter, n, n, successes,
+        max(run_j, 0.0), verify)
+
+
+class TestDistributionCerts(unittest.TestCase):
+    def test_jps_includes_verification(self):
+        c = eligibility.distribution_cert("e" * 16, "f", "r", "c", "m",
+                                          6, 6, 3, run_j=27.0, verify_j=3.0)
+        self.assertAlmostEqual(c["j_per_success"], 10.0)
+
+    def test_zero_successes_is_infinite(self):
+        c = eligibility.distribution_cert("e" * 16, "f", "r", "c", "m",
+                                          6, 6, 0, 1.0, 0.1)
+        self.assertEqual(c["j_per_success"], float("inf"))
+
+    def test_wilson_bounds(self):
+        lo, hi = eligibility.wilson_interval(6, 6)
+        self.assertLess(lo, 1.0)      # 6/6 is not certainty
+        self.assertAlmostEqual(hi, 1.0)
+        lo0, hi0 = eligibility.wilson_interval(0, 6)
+        self.assertEqual(lo0, 0.0)
+        self.assertGreater(hi0, 0.0)  # 0/6 does not prove impossibility
+
+    def test_pareto_three_survivors_and_domination(self):
+        # GPT's example: A(100%,20) B(95%,10) C(60%,2) all survive;
+        # D(96%,8) then dominates exactly B.
+        def mk(runner, successes, jps):
+            c = _cert(runner=runner, rate_k=successes, n=100, jps=jps)
+            return c
+        a = eligibility.distribution_cert("e"*16, "f", "A", "h", "m", 100, 100, 100, 2000.0, 0.0)
+        b = eligibility.distribution_cert("e"*16, "f", "B", "h", "m", 100, 100, 95, 950.0, 0.0)
+        c = eligibility.distribution_cert("e"*16, "f", "C", "h", "m", 100, 100, 60, 120.0, 0.0)
+        self.assertEqual(len(eligibility.pareto_frontier([a, b, c])), 3)
+        d = eligibility.distribution_cert("e"*16, "f", "D", "h", "m", 100, 100, 96, 768.0, 0.0)
+        self.assertTrue(eligibility.dominates(d, b))
+        self.assertFalse(eligibility.dominates(d, a))
+        self.assertFalse(eligibility.dominates(d, c))
+        front = eligibility.pareto_frontier([a, b, c, d])
+        self.assertEqual({x["runner"] for x in front}, {"A", "C", "D"})
+
+    def test_cross_meter_certs_never_dominate(self):
+        a = eligibility.distribution_cert("e"*16, "f", "A", "h", "m1", 6, 6, 6, 6.0, 0.0)
+        b = eligibility.distribution_cert("e"*16, "f", "B", "h", "m2", 6, 6, 1, 600.0, 0.0)
+        self.assertFalse(eligibility.dominates(a, b))
+
+    def test_insertion_mints_only_on_finite_domination(self):
+        a = eligibility.distribution_cert("e"*16, "f", "A", "h", "m", 6, 6, 6, 60.0, 0.0)
+        v_genesis = eligibility.assess_cert_insertion([], a)
+        self.assertFalse(v_genesis["mintable"])  # genesis mints nothing
+        better = eligibility.distribution_cert("e"*16, "f", "B", "h", "m", 6, 6, 6, 30.0, 0.0)
+        v = eligibility.assess_cert_insertion([a], better)
+        self.assertTrue(v["mintable"])
+        self.assertAlmostEqual(v["gain"], 5.0)  # 10 J/s -> 5 J/s
+        zero = eligibility.distribution_cert("e"*16, "f", "Z", "h", "m", 6, 6, 0, 0.5, 0.0)
+        v2 = eligibility.assess_cert_insertion([zero], a)
+        self.assertFalse(v2["mintable"])  # dominating an inf cert prices nothing
+
+    def test_small_epoch_not_eligible(self):
+        small = eligibility.distribution_cert("e"*16, "f", "A", "h", "m", 3, 3, 3, 3.0, 0.0)
+        self.assertFalse(eligibility.assess_cert_insertion([], small)["eligible"])
+
+
 if __name__ == "__main__":
     unittest.main()
