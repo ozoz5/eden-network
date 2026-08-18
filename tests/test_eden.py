@@ -81,6 +81,17 @@ class TestGroupStats(unittest.TestCase):
             groups = eden.group_stats(conn, "fam")
             self.assertEqual(len(groups), 2)
 
+    def test_hardware_never_shares_a_group(self):
+        # Same runner, same meter, different machine: separate sigma.
+        import json as _json
+        r1 = _json.loads(_receipt("r1", "m", 5.0))
+        r2 = _json.loads(_receipt("r1", "m", 9.0))
+        r1["hardware_profile"] = {"platform": "macOS-26.5.1-arm64", "machine": "arm64"}
+        r2["hardware_profile"] = {"platform": "macOS-26.5.2-arm64", "machine": "arm64"}
+        with TempLedger() as conn:
+            _insert(conn, "fam", [_json.dumps(r1), _json.dumps(r2)])
+            self.assertEqual(len(eden.group_stats(conn, "fam")), 2)
+
     def test_code_versions_never_share_a_group(self):
         # Same runner name, different implementation: no sigma inheritance.
         with TempLedger() as conn:

@@ -23,6 +23,8 @@ pending so callers cannot pretend they were checked:
   - challenge audit / hidden holdout (§6.13)
 """
 
+import hashlib
+
 K_SIGMA = 2.0          # interval half-width multiplier
 MIN_REPLICATIONS = 3   # receipts required to hold or take a record
 RHO_MAX = 1.0          # verification-to-run energy ratio ceiling for minting
@@ -38,18 +40,29 @@ def meter_class(meter_id: str) -> str:
     return METER_CLASSES.get(meter_id, "S")
 
 
+def hw_fingerprint(rec) -> str:
+    """Weak node identity from the receipt's declared hardware profile.
+
+    Two machines on the same OS build would collide — real node identity
+    needs signatures (Phase 2). Good enough to keep different machines from
+    sharing a sigma, which is the same class of error as mixing meters."""
+    hp = rec.get("hardware_profile") or {}
+    material = str(hp.get("platform", "")) + "|" + str(hp.get("machine", ""))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:6]
+
+
 def group_stats(receipts) -> list:
     """Fold parsed receipts into replication groups with certified intervals."""
     groups = {}
     for rec in receipts:
         key = (rec["runner_id"], rec.get("runner_code_hash", ""),
-               rec["meter_id"])
+               rec["meter_id"], hw_fingerprint(rec))
         g = groups.setdefault(key, {"e": [], "v": [], "cv": 0.0})
         g["e"].append(rec["run_energy"]["energy_joules"])
         g["v"].append(rec["verification_energy"]["energy_joules"])
         g["cv"] = max(g["cv"], rec["uncertainty_profile"]["assigned_cv"])
     out = []
-    for (runner, code_hash, meter), g in groups.items():
+    for (runner, code_hash, meter, hw), g in groups.items():
         n = len(g["e"])
         mean = sum(g["e"]) / n
         if n >= 3:
@@ -60,9 +73,9 @@ def group_stats(receipts) -> list:
             sigma = g["cv"] * mean  # systematic: no sqrt(n) reduction
             half = K_SIGMA * sigma
         out.append({
-            "group": f"{runner}#{code_hash[:6]}@{meter}",
+            "group": f"{runner}#{code_hash[:6]}@{meter}/hw{hw}",
             "runner": runner, "meter": meter, "code_hash": code_hash,
-            "meter_class": meter_class(meter),
+            "hw": hw, "meter_class": meter_class(meter),
             "n": n, "mean": mean, "sigma": sigma,
             "low": max(0.0, mean - half), "high": mean + half,
             "verify_mean": sum(g["v"]) / n,

@@ -806,6 +806,31 @@ def cmd_receipt_emit(run_id_prefix: str, conn=None, quiet=False):
     return rhash
 
 
+def cmd_import(path: str):
+    """Import foreign receipts (e.g. from another node's shadow run).
+
+    v0.4 honesty: imported receipts are UNSIGNED claims — the receipt's
+    declared hardware profile separates them into their own replication
+    groups, but nothing yet proves the claim (data-integrity: still open).
+    """
+    conn = db()
+    payload = json.loads(Path(path).read_text())
+    if isinstance(payload, dict):
+        payload = [payload]
+    added = 0
+    for rec in payload:
+        _check_forbidden(rec)
+        rj = canonical(rec)
+        rhash = sha(rj)[:16]
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO receipts VALUES (?,?,?,?,?,?)",
+            (rhash, "ext-" + rhash, rec["family_id"], rj, rhash, now_iso()),
+        )
+        added += cur.rowcount
+    conn.commit()
+    print(f"imported {added} foreign receipts ({len(payload) - added} already known)")
+
+
 def cmd_receipt_show(run_id_prefix: str):
     conn = db()
     row = conn.execute(
@@ -1391,6 +1416,9 @@ def main():
     prc.add_argument("action", choices=["emit", "show"])
     prc.add_argument("run_id")
 
+    pim = sub.add_parser("import", help="import foreign receipts (unsigned claims)")
+    pim.add_argument("path")
+
     pc = sub.add_parser("calibrate", help="σ report for runner×task receipts")
     pc.add_argument("--task", required=True)
     pc.add_argument("--runner", required=True)
@@ -1445,6 +1473,8 @@ def main():
         cmd_receipt_emit(a.run_id)
     elif a.cmd == "receipt" and a.action == "show":
         cmd_receipt_show(a.run_id)
+    elif a.cmd == "import":
+        cmd_import(a.path)
     elif a.cmd == "calibrate":
         cmd_calibrate(a.task, a.runner)
     elif a.cmd == "frontier":
