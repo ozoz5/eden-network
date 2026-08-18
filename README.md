@@ -88,7 +88,10 @@ What we can honestly claim from this ledger:
 - **Same meter, same verified result**: the targeted rule-based fix
   (0.343 J) beats brute-force mutation search (1.538 J) by ~4.5× — tight
   intervals, certified dominance, one simulated mint of +0.998 CREDIT net of
-  verification energy.
+  verification energy. This is not "rules beat LLMs": the rule runner carries
+  the bug class as prior knowledge. What the ledger prices is **the joule
+  value of knowing something** — here, knowing the fix pattern is worth
+  ~1.2 J per task against blind search.
 - **The LLM's real cost lives on the package meter**: ~51–159 J per verified
   fix (n=5, cv 57%), against a cpu-time-only apparent cost of ~2.4 J. Cpu-time
   metering misses roughly **20–60× of the energy** (GPU/ANE inference) — a

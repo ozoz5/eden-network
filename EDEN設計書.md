@@ -1,8 +1,8 @@
 # EDEN Protocol 設計書
 
 版: v2（frontier-mint転換後）
-日付: 2026-08-16
-状態: 概念設計の収束版。実装未着手。
+日付: 2026-08-16（実装記録は追補1〜4を参照）
+状態: v0実装済み・実測済み・公開済み（https://github.com/ozoz5/eden-network）。敵対監査1周通過。
 正本: このファイル。起源は2026-08-16の設計対話（初期構想v1 → レビュー → frontier-mint転換）。
 
 変更履歴:
@@ -328,6 +328,26 @@ Independently verified
 
 **監査で反証できなかった角度（記録）**: getrusageのpowermetrics汚染なし（reap順序で保護）、
 rootプロセスのリークなし、cputime解析正常、run/measurement孤児なし、topkタイブレーク決定論的。
+
+### v0実装記録 追補4（2026-08-18 — 外部レビュー（GPT）の反映）
+
+公開リポジトリへのGPTレビューを現物と突き合わせ。旧版READMEへの指摘（撤回済み数字等）を除き、生存3点を即日修正:
+- **複製群キーにrunner_code_hashを追加**: (runner_id, runner_code_hash, meter_id)。同名runnerのコード差し替えで
+  他実装のσを継承する攻撃を遮断。表示は `runner#hash6@meter`
+- **同一メーター内認証ゲート**: 異なるmeter classの群同士のdominanceは認証不能（§2.2のv0最小実装）。
+  バイアスした安価な計測が実測メーターの前線を奪う経路を遮断
+- **設計書ヘッダの「実装未着手」を実態に更新**
+
+採用した言い換え（GPT由来、公開文書へ反映）: code-fix実験が証明したのは「rule-based > LLM」ではなく
+**「正しい事前知識を持つspecialistはgeneralistより桁で省資源」**であり、EDENは
+**「この問題について事前知識を持つことの価値」を物理量（J）として測っている** — brute 1.538 J と
+rules 0.343 J の差は、PATTERN/FIXという知識が消した約1.2 Jである。
+
+§6へ追加:
+17. **Instance cherry-picking / challenge分布**: family_idはseedを除外するため、「偶然簡単なinstanceだけ提出する」
+    前線選別が可能。前線は「自由に選んだ問題の最小J」ではなく「プロトコルが配布するchallenge分布に対する期待J」で
+    定義すべき（§6.13の計測窓ゲーミングと対）。v0.1のFrontier eligibilityモジュール（meter class・runner hash・
+    challenge sampling・replication・ρ・audit条件の一元化）で扱う。
 
 ---
 

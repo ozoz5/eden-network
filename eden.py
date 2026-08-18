@@ -785,13 +785,15 @@ def group_stats(conn, family_id: str):
     groups = {}
     for r in rows:
         rec = json.loads(r["receipt_json"])
-        key = (rec["runner_id"], rec["meter_id"])
+        # A replication set is one CODE version on one meter — a renamed-or-
+        # rewritten runner must never inherit another implementation's sigma.
+        key = (rec["runner_id"], rec.get("runner_code_hash", ""), rec["meter_id"])
         g = groups.setdefault(key, {"e": [], "v": [], "cv": 0.0})
         g["e"].append(rec["run_energy"]["energy_joules"])
         g["v"].append(rec["verification_energy"]["energy_joules"])
         g["cv"] = max(g["cv"], rec["uncertainty_profile"]["assigned_cv"])
     out = []
-    for (runner, meter), g in groups.items():
+    for (runner, code_hash, meter), g in groups.items():
         n = len(g["e"])
         mean = sum(g["e"]) / n
         if n >= 3:
@@ -802,7 +804,8 @@ def group_stats(conn, family_id: str):
             sigma = g["cv"] * mean  # systematic: no sqrt(n) reduction
             half = K_SIGMA * sigma
         out.append({
-            "group": f"{runner}@{meter}", "runner": runner, "meter": meter,
+            "group": f"{runner}#{code_hash[:6]}@{meter}",
+            "runner": runner, "meter": meter, "code_hash": code_hash,
             "n": n, "mean": mean, "sigma": sigma,
             "low": max(0.0, mean - half), "high": mean + half,
             "verify_mean": sum(g["v"]) / n,
@@ -877,6 +880,15 @@ def cmd_frontier(task_prefix: str, commit: bool = False):
             conn.commit()
         print(f"\n  frontier unchanged: {holder['group']} "
               f"[{holder['low']:.3f}, {holder['high']:.3f}] J")
+        return
+
+    # Meter eligibility gate (§2.2): joules from different meter boundaries
+    # are different physical scales — dominance is only certifiable within
+    # the same meter class. A biased cheap meter must never beat a real one.
+    if candidate["meter"] != holder["meter"]:
+        print(f"\n  cross-meter challenge blocked: candidate on "
+              f"'{candidate['meter']}' vs frontier on '{holder['meter']}' — "
+              f"not certifiable (§2.2). no state change.")
         return
 
     # Certified dominance (§3): challenger high must clear holder low.

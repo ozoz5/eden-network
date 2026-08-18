@@ -13,9 +13,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import eden
 
 
-def _receipt(runner, meter, energy, verify=0.2, cv=0.15):
+def _receipt(runner, meter, energy, verify=0.2, cv=0.15, code="cafe01"):
     return json.dumps({
-        "runner_id": runner, "meter_id": meter,
+        "runner_id": runner, "meter_id": meter, "runner_code_hash": code,
         "run_energy": {"energy_joules": energy},
         "verification_energy": {"energy_joules": verify},
         "uncertainty_profile": {"assigned_cv": cv},
@@ -77,6 +77,16 @@ class TestGroupStats(unittest.TestCase):
             _insert(conn, "fam", [
                 _receipt("r1", "estimated-cpu-v1", 5.0),
                 _receipt("r1", "powermetrics-package-v1", 9.0),
+            ])
+            groups = eden.group_stats(conn, "fam")
+            self.assertEqual(len(groups), 2)
+
+    def test_code_versions_never_share_a_group(self):
+        # Same runner name, different implementation: no sigma inheritance.
+        with TempLedger() as conn:
+            _insert(conn, "fam", [
+                _receipt("r1", "m", 5.0, code="aaaaaa"),
+                _receipt("r1", "m", 4.9, code="bbbbbb"),
             ])
             groups = eden.group_stats(conn, "fam")
             self.assertEqual(len(groups), 2)
