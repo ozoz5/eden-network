@@ -459,6 +459,14 @@ CREATE TABLE IF NOT EXISTS epoch_runs(
   instance_index INTEGER NOT NULL,
   runner_id TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS chain(
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  receipt_id TEXT UNIQUE NOT NULL,
+  receipt_hash TEXT NOT NULL,
+  prev_chain TEXT NOT NULL,
+  chain_hash TEXT NOT NULL,
+  chained_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS ores(
   ore_hash TEXT PRIMARY KEY,
   receipt_id TEXT NOT NULL,
@@ -1400,6 +1408,69 @@ def cmd_challenge_frontier(family_prefix: str):
               f"J/success {jps}")
 
 
+CHAIN_GENESIS = "EDEN-genesis"
+
+
+def cmd_chain_build():
+    """Append every unchained receipt to the tamper-evident journal.
+
+    Audit findings 10/16: an 'immutable' ledger that a single UPDATE can
+    rewrite is immutable in name only. The chain makes edits DETECTABLE
+    (not impossible): each entry commits to the previous one, and the head
+    can be anchored externally (e.g. in a public git history).
+    """
+    conn = db()
+    head_row = conn.execute(
+        "SELECT chain_hash FROM chain ORDER BY seq DESC LIMIT 1").fetchone()
+    head = head_row["chain_hash"] if head_row else sha(CHAIN_GENESIS)
+    rows = conn.execute(
+        "SELECT receipt_id, receipt_hash FROM receipts WHERE receipt_id NOT IN "
+        "(SELECT receipt_id FROM chain) ORDER BY created_at, receipt_id"
+    ).fetchall()
+    for r in rows:
+        prev = head
+        head = sha(prev + r["receipt_hash"])
+        conn.execute("INSERT INTO chain(receipt_id, receipt_hash, prev_chain, "
+                     "chain_hash, chained_at) VALUES (?,?,?,?,?)",
+                     (r["receipt_id"], r["receipt_hash"], prev, head, now_iso()))
+    conn.commit()
+    total = conn.execute("SELECT COUNT(*) c FROM chain").fetchone()["c"]
+    print(f"chained {len(rows)} new receipts (journal length {total})")
+    print(f"chain head: {head}")
+
+
+def cmd_chain_verify():
+    """Recompute the whole chain AND every receipt hash from its body."""
+    conn = db()
+    head = sha(CHAIN_GENESIS)
+    ok = True
+    for row in conn.execute("SELECT * FROM chain ORDER BY seq"):
+        rec = conn.execute("SELECT receipt_json, receipt_hash FROM receipts "
+                           "WHERE receipt_id=?", (row["receipt_id"],)).fetchone()
+        if rec is None:
+            print(f"  seq {row['seq']}: MISSING receipt {row['receipt_id']}")
+            ok = False
+            continue
+        body_hash = sha(rec["receipt_json"])[:16]
+        if body_hash != rec["receipt_hash"] or body_hash != row["receipt_hash"]:
+            print(f"  seq {row['seq']}: TAMPERED receipt body "
+                  f"({row['receipt_id']})")
+            ok = False
+        head = sha(head + row["receipt_hash"])
+        if head != row["chain_hash"]:
+            print(f"  seq {row['seq']}: BROKEN chain link")
+            ok = False
+            head = row["chain_hash"]  # resync to report further breaks once
+    n = conn.execute("SELECT COUNT(*) c FROM chain").fetchone()["c"]
+    unchained = conn.execute(
+        "SELECT COUNT(*) c FROM receipts WHERE receipt_id NOT IN "
+        "(SELECT receipt_id FROM chain)").fetchone()["c"]
+    print(f"chain: {n} entries, {unchained} receipts not yet chained")
+    print(f"verdict: {'INTACT' if ok else 'TAMPER DETECTED'}")
+    print(f"head: {head}")
+    return ok
+
+
 def cmd_ore_scan():
     """Seal receipts with the first epoch opened after them; keep the rare.
 
@@ -1487,6 +1558,9 @@ def main():
     pim = sub.add_parser("import", help="import foreign receipts (unsigned claims)")
     pim.add_argument("path")
 
+    pchn = sub.add_parser("chain", help="tamper-evident receipt journal")
+    pchn.add_argument("action", choices=["build", "verify"])
+
     por = sub.add_parser("ore", help="the cultural layer (v1 spec 13)")
     por.add_argument("action", choices=["scan", "list"])
 
@@ -1549,6 +1623,10 @@ def main():
         cmd_receipt_show(a.run_id)
     elif a.cmd == "import":
         cmd_import(a.path)
+    elif a.cmd == "chain" and a.action == "build":
+        cmd_chain_build()
+    elif a.cmd == "chain" and a.action == "verify":
+        sys.exit(0 if cmd_chain_verify() else 1)
     elif a.cmd == "ore" and a.action == "scan":
         cmd_ore_scan()
     elif a.cmd == "ore" and a.action == "list":

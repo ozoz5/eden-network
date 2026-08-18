@@ -248,6 +248,15 @@ trigger a mint lives in one auditable module, [`eligibility.py`](eligibility.py)
   every assessment — the gate cannot pretend they were checked.
 - Raw observables (cpu-seconds, mW samples, model constants) are stored in
   every receipt so joules can be re-derived later (Constitution IV).
+- **Tamper-evidence**: `eden chain build` maintains an append-only journal
+  where every entry commits to the previous one; `eden chain verify`
+  re-hashes every receipt body and every link. Edits are not impossible on
+  a single node — they are *detectable*, and the chain head is anchored in
+  this repository's public commit history.
+- The cultural layer: `eden ore scan` — receipts are sealed by the seed of
+  the first epoch opened after them (unchoosable randomness); rare hashes
+  are OREs. No economic linkage, by constitution and by test.
+- `eden html` renders the ledger — frontiers, mints, ores — as one page.
 
 ### Level V setup (macOS, optional)
 
