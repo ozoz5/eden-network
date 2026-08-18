@@ -23,6 +23,7 @@ import inspect
 import json
 import platform
 import random
+import re
 import resource
 import shutil
 import sqlite3
@@ -37,6 +38,7 @@ from pathlib import Path
 
 import challenge as challenge_mod
 import eligibility
+import journal as journal_mod
 import ore as ore_mod
 
 BASE = Path(__file__).resolve().parent
@@ -461,11 +463,14 @@ CREATE TABLE IF NOT EXISTS epoch_runs(
 );
 CREATE TABLE IF NOT EXISTS chain(
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
-  receipt_id TEXT UNIQUE NOT NULL,
-  receipt_hash TEXT NOT NULL,
+  entry_id TEXT UNIQUE NOT NULL,
+  entry_hash TEXT NOT NULL,
   prev_chain TEXT NOT NULL,
   chain_hash TEXT NOT NULL,
-  chained_at TEXT NOT NULL
+  chained_at TEXT NOT NULL,
+  entry_type TEXT,
+  hash_rule TEXT,
+  entry_body TEXT
 );
 CREATE TABLE IF NOT EXISTS ores(
   ore_hash TEXT PRIMARY KEY,
@@ -510,6 +515,18 @@ def db() -> sqlite3.Connection:
             conn.execute(f"ALTER TABLE epochs ADD COLUMN {col} TEXT")
         except sqlite3.OperationalError:
             pass  # column already exists
+    # The journal predates non-receipt entries; renaming the columns leaves
+    # every stored value and every chain hash untouched.
+    for old, new in (("receipt_id", "entry_id"), ("receipt_hash", "entry_hash")):
+        try:
+            conn.execute(f"ALTER TABLE chain RENAME COLUMN {old} TO {new}")
+        except sqlite3.OperationalError:
+            pass
+    for col in ("entry_type", "hash_rule", "entry_body"):
+        try:
+            conn.execute(f"ALTER TABLE chain ADD COLUMN {col} TEXT")
+        except sqlite3.OperationalError:
+            pass
     return conn
 
 
@@ -1480,64 +1497,201 @@ def cmd_challenge_frontier(family_prefix: str):
 CHAIN_GENESIS = "EDEN-genesis"
 
 
+def _rule_changes(conn):
+    """Rule history, read from the journal itself."""
+    changes = []
+    for row in conn.execute(
+            "SELECT entry_body FROM chain WHERE entry_type='rule_change' "
+            "ORDER BY seq"):
+        if row["entry_body"]:
+            changes.append(json.loads(row["entry_body"]))
+    return changes
+
+
+def _legacy_boundary(conn) -> int:
+    """Last seq governed by the original receipt-only rule. Before any rule
+    change every entry is a legacy receipt, so the boundary is the whole
+    journal."""
+    for ch in _rule_changes(conn):
+        if "legacy_boundary" in ch:
+            return ch["legacy_boundary"]
+    return conn.execute("SELECT COALESCE(MAX(seq),0) m FROM chain"
+                        ).fetchone()["m"]
+
+
+def _chain_append(conn, entry_type: str, entry_id: str, body: str, rule: str,
+                  store_body: bool = True):
+    """store_body=False for receipts: their text lives in the receipts table,
+    and a copy inside the journal would be verified instead of the original,
+    hiding edits to the source of truth."""
+    head_row = conn.execute(
+        "SELECT chain_hash FROM chain ORDER BY seq DESC LIMIT 1").fetchone()
+    prev = head_row["chain_hash"] if head_row else sha(CHAIN_GENESIS)
+    e_hash = journal_mod.entry_hash(rule, entry_type, body)
+    head = sha(prev + e_hash)
+    conn.execute(
+        "INSERT INTO chain(entry_id, entry_hash, prev_chain, chain_hash, "
+        "chained_at, entry_type, hash_rule, entry_body) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (entry_id, e_hash, prev, head, now_iso(), entry_type, rule,
+         body if store_body else None))
+    return head
+
+
+def _next_rule(conn) -> str:
+    """The rule governing the entry that would be appended next."""
+    nxt = 1 + (conn.execute("SELECT COALESCE(MAX(seq),0) m FROM chain")
+               .fetchone()["m"])
+    return journal_mod.rule_at(_rule_changes(conn), nxt)
+
+
 def cmd_chain_build():
     """Append every unchained receipt to the tamper-evident journal.
 
-    Audit findings 10/16: an 'immutable' ledger that a single UPDATE can
-    rewrite is immutable in name only. The chain makes edits DETECTABLE
-    (not impossible): each entry commits to the previous one, and the head
-    can be anchored externally (e.g. in a public git history).
+    An 'immutable' ledger that a single UPDATE can rewrite is immutable in
+    name only. Each entry commits to the previous one, so edits become
+    detectable once a head is anchored externally.
     """
     conn = db()
-    head_row = conn.execute(
-        "SELECT chain_hash FROM chain ORDER BY seq DESC LIMIT 1").fetchone()
-    head = head_row["chain_hash"] if head_row else sha(CHAIN_GENESIS)
     rows = conn.execute(
-        "SELECT receipt_id, receipt_hash FROM receipts WHERE receipt_id NOT IN "
-        "(SELECT receipt_id FROM chain) ORDER BY created_at, receipt_id"
+        "SELECT receipt_id, receipt_json FROM receipts WHERE receipt_id NOT IN "
+        "(SELECT entry_id FROM chain) ORDER BY created_at, receipt_id"
     ).fetchall()
+    head = None
     for r in rows:
-        prev = head
-        head = sha(prev + r["receipt_hash"])
-        conn.execute("INSERT INTO chain(receipt_id, receipt_hash, prev_chain, "
-                     "chain_hash, chained_at) VALUES (?,?,?,?,?)",
-                     (r["receipt_id"], r["receipt_hash"], prev, head, now_iso()))
+        rule = _next_rule(conn)
+        head = _chain_append(conn, "receipt", r["receipt_id"],
+                             r["receipt_json"], rule, store_body=False)
     conn.commit()
     total = conn.execute("SELECT COUNT(*) c FROM chain").fetchone()["c"]
+    if head is None:
+        head = conn.execute(
+            "SELECT chain_hash FROM chain ORDER BY seq DESC LIMIT 1"
+        ).fetchone()["chain_hash"]
     print(f"chained {len(rows)} new receipts (journal length {total})")
     print(f"chain head: {head}")
 
 
-def cmd_chain_verify():
-    """Recompute the whole chain AND every receipt hash from its body."""
+def cmd_chain_migrate():
+    """Record the hash-rule change as an entry written under the OLD rule.
+
+    A transition signed under the rule it introduces would authorise itself.
+    The outgoing rule certifies the doorway; entries after it use the new one.
+    The manifest binds the types and rules assigned to pre-migration entries,
+    which the columns added by the migration cannot do on their own.
+    """
     conn = db()
+    if any(c.get("new_rule") == journal_mod.DOMAIN_RULE
+           for c in _rule_changes(conn)):
+        print("journal already migrated to " + journal_mod.DOMAIN_RULE)
+        return
+    boundary = conn.execute("SELECT COALESCE(MAX(seq),0) m FROM chain"
+                            ).fetchone()["m"]
+    manifest = [{"seq": r["seq"], "entry_type": "receipt",
+                 "hash_rule": journal_mod.LEGACY_RULE,
+                 "entry_hash": r["entry_hash"]}
+                for r in conn.execute(
+                    "SELECT seq, entry_hash FROM chain ORDER BY seq")]
+    reasons = journal_mod.validate_rule_change(journal_mod.LEGACY_RULE,
+                                               journal_mod.DOMAIN_RULE)
+    if reasons:
+        sys.exit("error: " + "; ".join(reasons))
+    body = canonical({
+        "from_seq": boundary + 2,          # the transition itself stays legacy
+        "old_rule": journal_mod.LEGACY_RULE,
+        "new_rule": journal_mod.DOMAIN_RULE,
+        "legacy_boundary": boundary,
+        "manifest_sha256": sha(canonical(manifest)),
+        "manifest_entries": len(manifest),
+        "reason": "domain separation of entry hashes",
+    })
+    head = _chain_append(conn, "rule_change", "rule_change:" + sha(body)[:16],
+                         body, journal_mod.LEGACY_RULE)
+    conn.execute("UPDATE chain SET entry_type='receipt', hash_rule=? "
+                 "WHERE seq<=? AND entry_type IS NULL",
+                 (journal_mod.LEGACY_RULE, boundary))
+    conn.commit()
+    print(f"rule change recorded at seq {boundary + 1} under "
+          f"{journal_mod.LEGACY_RULE}")
+    print(f"  entries 1..{boundary}: {journal_mod.LEGACY_RULE} "
+          f"(manifest {sha(canonical(manifest))[:16]}…)")
+    print(f"  entries {boundary + 2}..: {journal_mod.DOMAIN_RULE}")
+    print(f"chain head: {head}")
+    print("anchor this head publicly before appending signed entries")
+
+
+def cmd_chain_verify():
+    """Recompute every entry hash and link under the rule in force at its seq."""
+    conn = db()
+    changes = _rule_changes(conn)
+    boundary = _legacy_boundary(conn)
     head = sha(CHAIN_GENESIS)
     ok = True
     for row in conn.execute("SELECT * FROM chain ORDER BY seq"):
-        rec = conn.execute("SELECT receipt_json, receipt_hash FROM receipts "
-                           "WHERE receipt_id=?", (row["receipt_id"],)).fetchone()
-        if rec is None:
-            print(f"  seq {row['seq']}: MISSING receipt {row['receipt_id']}")
+        seq = row["seq"]
+        rule = journal_mod.rule_at(changes, seq)
+        declared = row["hash_rule"]
+        if declared and declared != rule:
+            print(f"  seq {seq}: rule mismatch (claims {declared}, "
+                  f"history says {rule})")
             ok = False
-            continue
-        body_hash = sha(rec["receipt_json"])[:16]
-        if body_hash != rec["receipt_hash"] or body_hash != row["receipt_hash"]:
-            print(f"  seq {row['seq']}: TAMPERED receipt body "
-                  f"({row['receipt_id']})")
+        etype = row["entry_type"] or journal_mod.legacy_type_of(seq, boundary)
+        if seq <= boundary:
+            etype = journal_mod.legacy_type_of(seq, boundary)
+        if etype == "receipt":
+            rec = conn.execute(
+                "SELECT receipt_json FROM receipts WHERE receipt_id=?",
+                (row["entry_id"],)).fetchone()
+            body = rec["receipt_json"] if rec else None
+        else:
+            body = row["entry_body"]
+        if body is None:
+            print(f"  seq {seq}: MISSING body for {row['entry_id']}")
             ok = False
-        head = sha(head + row["receipt_hash"])
+        else:
+            recomputed = journal_mod.entry_hash(rule, etype, body)
+            if recomputed != row["entry_hash"]:
+                print(f"  seq {seq}: TAMPERED body ({row['entry_id']})")
+                ok = False
+        head = sha(head + row["entry_hash"])
         if head != row["chain_hash"]:
-            print(f"  seq {row['seq']}: BROKEN chain link")
+            print(f"  seq {seq}: BROKEN chain link")
             ok = False
-            head = row["chain_hash"]  # resync to report further breaks once
+            head = row["chain_hash"]
     n = conn.execute("SELECT COUNT(*) c FROM chain").fetchone()["c"]
     unchained = conn.execute(
         "SELECT COUNT(*) c FROM receipts WHERE receipt_id NOT IN "
-        "(SELECT receipt_id FROM chain)").fetchone()["c"]
+        "(SELECT entry_id FROM chain)").fetchone()["c"]
     print(f"chain: {n} entries, {unchained} receipts not yet chained")
     print(f"verdict: {'INTACT' if ok else 'TAMPER DETECTED'}")
     print(f"head: {head}")
     return ok
+
+
+def cmd_chain_status():
+    """Entries past the last anchored head are still rewritable locally."""
+    conn = db()
+    total = conn.execute("SELECT COALESCE(MAX(seq),0) m FROM chain"
+                         ).fetchone()["m"]
+    anchored = 0
+    try:
+        log = subprocess.run(["git", "log", "--all", "--format=%B"],
+                             capture_output=True, text=True, cwd=BASE).stdout
+        heads = set(re.findall(r"\b[0-9a-f]{64}\b", log))
+        for row in conn.execute("SELECT seq, chain_hash FROM chain "
+                                "ORDER BY seq DESC"):
+            if row["chain_hash"] in heads:
+                anchored = row["seq"]
+                break
+    except OSError:
+        pass
+    print(f"journal length : {total}")
+    print(f"anchored to seq: {anchored} (found in this repository's commits)")
+    print(f"UNPROTECTED    : {total - anchored} entries")
+    print(f"current rule   : {_next_rule(conn)}")
+    if total - anchored:
+        print("these entries are rewritable by whoever holds the local ledger "
+              "— anchor the head to fix them")
 
 
 def cmd_ore_scan():
@@ -1627,8 +1781,9 @@ def main():
     pim = sub.add_parser("import", help="import foreign receipts (unsigned claims)")
     pim.add_argument("path")
 
-    pchn = sub.add_parser("chain", help="tamper-evident receipt journal")
-    pchn.add_argument("action", choices=["build", "verify"])
+    pchn = sub.add_parser("chain", help="tamper-evident journal")
+    pchn.add_argument("action",
+                      choices=["build", "verify", "migrate", "status"])
 
     por = sub.add_parser("ore", help="the cultural layer (v1 spec 13)")
     por.add_argument("action", choices=["scan", "list"])
@@ -1696,6 +1851,10 @@ def main():
         cmd_chain_build()
     elif a.cmd == "chain" and a.action == "verify":
         sys.exit(0 if cmd_chain_verify() else 1)
+    elif a.cmd == "chain" and a.action == "migrate":
+        cmd_chain_migrate()
+    elif a.cmd == "chain" and a.action == "status":
+        cmd_chain_status()
     elif a.cmd == "ore" and a.action == "scan":
         cmd_ore_scan()
     elif a.cmd == "ore" and a.action == "list":

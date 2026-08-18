@@ -340,6 +340,32 @@ body = {from_seq: 148, field: "entry_hash", old_rule: "v1-legacy",
 この entry 自体が seq を持ち、chainに刻まれ、以降のanchorで外部固定される。
 **プロトコルが自分の規則変更を自分の台帳へ記録する** — 規則の履歴もまた観測事実になる。
 
+### 10.5 第5次監査の3指摘 — 設計へ反映し、実装済み
+
+- **HIGH 1 循環（rule_changeが新規則で自分を正当化する）** → transition entryは
+  **旧規則で刻む**。seq 148 = rule_change (v1-legacy, 16hex)、seq 149以降がv2-domain。
+  旧世界が新世界への入口を認証する
+- **HIGH 2 規則の自己申告** → `rule_at(seq)` をjournal履歴から導出する
+  （`journal.py`）。entryの`hash_rule`列は冗長な表示値であり、
+  検証時に履歴と食い違えば **rule mismatch** として拒否する
+- **HIGH 3 後付けmetadataは旧chainに保護されていない** → 移行前entryの型と規則は
+  DBの列ではなく **protocol migration rule**（`journal.legacy_type_of`）で導出する。
+  さらに147件の(seq, type, rule, entry_hash)を **migration manifest** として
+  canonicalizeし、そのhashをtransition entryのbodyへ含めた
+  （manifest自体が旧規則のentry_hashで保護され、次のanchorで外部固定される）
+- **rule_changeに万能の権限を与えない** → `journal.SUPPORTED_RULES` と
+  `RULE_STRENGTH` により、未知規則とdowngradeをVerifierが拒否する。
+  journalは「規則が変わった事実」を記録するが、どんな規則でも正当化しない
+
+### 10.6 実装中に発見した後退（同日、テストが捕捉）
+
+汎用journal化の初版で、レシート本文のコピーを`entry_body`列へ保存した結果、
+**検証がコピーを見てreceiptsテーブルの改竄を検出できなくなった**（既存テスト2件が失敗）。
+レシート本文の正本は`receipts`テーブルであり、journalはhashのみを持つ。
+`store_body=False` を receipt entry に適用して修正。
+教訓: **正本の二重化は改竄検出を殺す。** journalに置いてよいのは、
+他に本文の置き場がないentry（rule_change等）だけ。
+
 ### 10.4 実装順序への影響（Phase A改訂）
 
 1. chain汎用journal化（列追加 + hash_rule='v1-legacy' を既存147件へ）
