@@ -109,13 +109,24 @@ What we can honestly claim from this ledger:
 
 ## Measurement honesty
 
-- Frontier groups are `(runner, meter)` — receipts on different meter
-  boundaries never share a σ.
+Every condition that decides whether a receipt group may hold a record or
+trigger a mint lives in one auditable module, [`eligibility.py`](eligibility.py):
+
+- Replication groups are `(runner, runner_code_hash, meter)` — a renamed or
+  rewritten runner never inherits another implementation's σ, and receipts on
+  different meter boundaries never share a scale.
 - Protocol-assigned uncertainty (systematic) does **not** shrink with √n;
   only measured σ (n ≥ 3) does. Interval lower bounds clamp at 0.
+- Dominance across meter boundaries is undefined; records need n ≥ 3.
+- **ρ gate**: a group whose verification costs more than its run
+  (ρ = E_verify/E_run > 1) can still take the record, but mints nothing —
+  certification is history, minting is economics.
 - Verification energy is measured with the same meter class as the run.
 - `frontier` is read-only; issuance requires an explicit `--commit`, repeated
   transitions never re-mint.
+- Checks the spec requires but v0.1 does not yet enforce (challenge sampling,
+  independent replication, challenge audit) are reported as `pending` on
+  every assessment — the gate cannot pretend they were checked.
 - Raw observables (cpu-seconds, mW samples, model constants) are stored in
   every receipt so joules can be re-derived later (Constitution IV).
 

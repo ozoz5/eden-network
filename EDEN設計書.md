@@ -349,6 +349,25 @@ rules 0.343 J の差は、PATTERN/FIXという知識が消した約1.2 Jであ�
     定義すべき（§6.13の計測窓ゲーミングと対）。v0.1のFrontier eligibilityモジュール（meter class・runner hash・
     challenge sampling・replication・ρ・audit条件の一元化）で扱う。
 
+### v0実装記録 追補5（2026-08-18 — v0.1: Frontier eligibilityモジュール）
+
+発行に関わる全条件を `eligibility.py` として独立モジュール化（GPTレビュー提案の採用）。eden.pyは委譲のみ。
+
+**強制される条件（テスト25本で固定）:**
+- 複製キー (runner_id, runner_code_hash, meter_id)
+- σ規則: 実測σ(n≥3)のみ√n縮小、assigned_cvは全幅、下限0クランプ
+- 同一メーター内でのみdominance定義（異メーター比較は認証不能）
+- 記録保持・奪取に最小再現数 n≥3（MIN_REPLICATIONS）
+- **ρゲート**: ρ = E_verify/E_run > 1.0 の群は記録は取れるがmintは発生しない（§5のmint定義域のコード化。
+  認証と発行の分離 — 記録は歴史、mintは経済）
+- 純利得 > 0（憲法III）
+
+**未強制の条件（§2.2/§6由来。assessは常に "pending" として明示報告し、検査済みを偽装できない）:**
+challenge sampling（§6.17）／独立再現（§6.2）／challenge audit・hidden holdout（§6.13）
+
+これによりv0.1の発行規則は全て単一ファイルで監査・単体テスト可能になった。「single file on purpose」は
+「two files on purpose」に改訂（パイプラインと発行規則の分離はReceipt/Frontier/Mint三層分離の実装版）。
+
 ---
 
 ## 8. 検証済みの外部事実（2026-08-16時点の調査）

@@ -12,7 +12,9 @@ Constitution (§1) enforced in code:
   IV  Facts Outlive Rules:           receipts store raw observations (cpu seconds,
       meter model parameters); joules are derived and re-derivable later.
 
-Single file on purpose (v0). Python stdlib only. SQLite ledger.
+v0.1: two files on purpose — eden.py (pipeline) + eligibility.py (every
+issuance condition, isolated so it can be audited and tested alone).
+Python stdlib only. SQLite ledger.
 """
 
 import argparse
@@ -33,6 +35,8 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
+import eligibility
+
 BASE = Path(__file__).resolve().parent
 DB_PATH = BASE / "eden.db"
 DATA_DIR = BASE / "data"
@@ -41,7 +45,7 @@ RUNNERS_DIR = BASE / "runners"
 RECEIPT_VERSION = "eden-receipt/2"
 # §2.1: fields that must never appear in a receipt (economic interpretation).
 FORBIDDEN_RECEIPT_KEYS = ("baseline", "saved", "mint", "efficiency_ratio")
-K_SIGMA = 2.0  # interval half-width multiplier for certified dominance
+K_SIGMA = eligibility.K_SIGMA  # issuance rules live in eligibility.py (v0.1)
 
 
 def sha(data) -> str:
@@ -770,48 +774,13 @@ def cmd_receipt_show(run_id_prefix: str):
 def group_stats(conn, family_id: str):
     """Frontier input = receipts only (Constitution I).
 
-    Audit fixes (2026-08-18):
-    - Groups are stratified by (runner_id, meter_id): receipts measured on
-      different meter boundaries are different physical scales and must never
-      share a sigma.
-    - Replication (sqrt(n)) narrows only MEASURED sigma (n >= 3). The
-      protocol-assigned cv is a systematic uncertainty and does not average
-      out, so it is used at full width regardless of n.
-    - Interval lower bounds are clamped at 0 (energy cannot be negative).
+    All grouping and interval rules live in eligibility.py (v0.1) — this is
+    just the ledger read plus delegation.
     """
     rows = conn.execute(
         "SELECT receipt_json FROM receipts WHERE family_id=?", (family_id,)
     ).fetchall()
-    groups = {}
-    for r in rows:
-        rec = json.loads(r["receipt_json"])
-        # A replication set is one CODE version on one meter — a renamed-or-
-        # rewritten runner must never inherit another implementation's sigma.
-        key = (rec["runner_id"], rec.get("runner_code_hash", ""), rec["meter_id"])
-        g = groups.setdefault(key, {"e": [], "v": [], "cv": 0.0})
-        g["e"].append(rec["run_energy"]["energy_joules"])
-        g["v"].append(rec["verification_energy"]["energy_joules"])
-        g["cv"] = max(g["cv"], rec["uncertainty_profile"]["assigned_cv"])
-    out = []
-    for (runner, code_hash, meter), g in groups.items():
-        n = len(g["e"])
-        mean = sum(g["e"]) / n
-        if n >= 3:
-            var = sum((x - mean) ** 2 for x in g["e"]) / (n - 1)
-            sigma = var ** 0.5
-            half = K_SIGMA * sigma / (n ** 0.5)
-        else:
-            sigma = g["cv"] * mean  # systematic: no sqrt(n) reduction
-            half = K_SIGMA * sigma
-        out.append({
-            "group": f"{runner}#{code_hash[:6]}@{meter}",
-            "runner": runner, "meter": meter, "code_hash": code_hash,
-            "n": n, "mean": mean, "sigma": sigma,
-            "low": max(0.0, mean - half), "high": mean + half,
-            "verify_mean": sum(g["v"]) / n,
-        })
-    out.sort(key=lambda g: g["high"])
-    return out
+    return eligibility.group_stats([json.loads(r["receipt_json"]) for r in rows])
 
 
 def _set_state(conn, fam, g):
@@ -852,6 +821,11 @@ def cmd_frontier(task_prefix: str, commit: bool = False):
     if state is None:
         if not commit:
             return
+        rec = eligibility.assess_record(candidate)
+        if not rec["eligible"]:
+            print(f"\n  no record established: {candidate['group']} — "
+                  + "; ".join(rec["reasons"]))
+            return
         _set_state(conn, fam, candidate)
         conn.commit()
         print()
@@ -860,7 +834,8 @@ def cmd_frontier(task_prefix: str, commit: bool = False):
         print(f"  {candidate['group']}: {candidate['mean']:.3f} J  "
               f"[{candidate['low']:.3f}, {candidate['high']:.3f}]  n={candidate['n']}")
         print("  (unaudited genesis — mint baseline integrity is an open "
-              "problem, see 設計書 §6)")
+              "problem, see 設計書 §6; pending checks: "
+              + ", ".join(rec["pending"]) + ")")
         print("  " + "=" * 52)
         return
 
@@ -882,60 +857,55 @@ def cmd_frontier(task_prefix: str, commit: bool = False):
               f"[{holder['low']:.3f}, {holder['high']:.3f}] J")
         return
 
-    # Meter eligibility gate (§2.2): joules from different meter boundaries
-    # are different physical scales — dominance is only certifiable within
-    # the same meter class. A biased cheap meter must never beat a real one.
-    if candidate["meter"] != holder["meter"]:
-        print(f"\n  cross-meter challenge blocked: candidate on "
-              f"'{candidate['meter']}' vs frontier on '{holder['meter']}' — "
-              f"not certifiable (§2.2). no state change.")
+    # All certification and minting conditions live in eligibility.py (v0.1).
+    verdict = eligibility.assess_transition(holder, candidate)
+    if not verdict["certifiable"]:
+        print(f"\n  challenger {candidate['group']} not certified: "
+              + "; ".join(verdict["reasons"]))
         return
 
-    # Certified dominance (§3): challenger high must clear holder low.
-    if candidate["high"] < holder["low"]:
-        gain = max(0.0, holder["low"] - candidate["high"] - candidate["verify_mean"])
-        if not commit:
-            print(f"\n  would certify: {candidate['group']} dominates "
-                  f"{holder['group']} (net gain {gain:.3f} J) — rerun with --commit")
-            return
-        already = conn.execute(
-            "SELECT 1 FROM mints WHERE family_id=? AND prev_group=? AND new_group=?",
-            (fam, holder["group"], candidate["group"]),
-        ).fetchone()
-        if gain > 0 and already is None:
-            conn.execute(
-                "INSERT INTO mints(family_id, prev_group, new_group, prev_low_j, "
-                "new_high_j, verify_energy_j, certified_gain_j, note, created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
-                (fam, holder["group"], candidate["group"], holder["low"],
-                 candidate["high"], candidate["verify_mean"], gain,
-                 "SIMULATED", now_iso()),
-            )
-        _set_state(conn, fam, candidate)
-        conn.commit()
-        print()
-        print("  " + "=" * 52)
-        print(f"  NEW FRONTIER   family={fam}")
-        print(f"  Previous: {holder['mean']:8.3f} J  [{holder['low']:.3f}, "
-              f"{holder['high']:.3f}]  ({holder['group']}, n={holder['n']})")
-        print(f"  New:      {candidate['mean']:8.3f} J  [{candidate['low']:.3f}, "
-              f"{candidate['high']:.3f}]  ({candidate['group']}, n={candidate['n']})")
-        print(f"  ΔE(mean): {holder['mean']-candidate['mean']:.3f} J")
-        if gain > 0 and already is None:
-            print(f"  Certified net gain (III): {gain:.3f} J"
-                  f"   [= prev_low − new_high − E_verify]")
-            print(f"  MINT (simulated): +{gain:.3f} CREDIT"
-                  f"  (1 CREDIT ≡ 1 certified J — v0 provisional)")
-        elif already is not None:
-            print("  transition already minted once — no re-mint (grinding guard)")
-        else:
-            print("  frontier updated, NO MINT: net gain 0 after verification "
-                  "cost (Constitution III)")
-        print("  " + "=" * 52)
+    gain = verdict["gain"]
+    if not commit:
+        print(f"\n  would certify: {candidate['group']} dominates "
+              f"{holder['group']}"
+              + (f" (mint {gain:.3f} J)" if verdict["mintable"]
+                 else f" (no mint: {'; '.join(verdict['mint_reasons'])})")
+              + " — rerun with --commit")
+        return
+    already = conn.execute(
+        "SELECT 1 FROM mints WHERE family_id=? AND prev_group=? AND new_group=?",
+        (fam, holder["group"], candidate["group"]),
+    ).fetchone()
+    if verdict["mintable"] and already is None:
+        conn.execute(
+            "INSERT INTO mints(family_id, prev_group, new_group, prev_low_j, "
+            "new_high_j, verify_energy_j, certified_gain_j, note, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (fam, holder["group"], candidate["group"], holder["low"],
+             candidate["high"], candidate["verify_mean"], gain,
+             "SIMULATED", now_iso()),
+        )
+    _set_state(conn, fam, candidate)
+    conn.commit()
+    print()
+    print("  " + "=" * 52)
+    print(f"  NEW FRONTIER   family={fam}")
+    print(f"  Previous: {holder['mean']:8.3f} J  [{holder['low']:.3f}, "
+          f"{holder['high']:.3f}]  ({holder['group']}, n={holder['n']})")
+    print(f"  New:      {candidate['mean']:8.3f} J  [{candidate['low']:.3f}, "
+          f"{candidate['high']:.3f}]  ({candidate['group']}, n={candidate['n']})")
+    print(f"  ΔE(mean): {holder['mean']-candidate['mean']:.3f} J")
+    if verdict["mintable"] and already is None:
+        print(f"  Certified net gain (III): {gain:.3f} J"
+              f"   [= prev_low − new_high − E_verify]")
+        print(f"  MINT (simulated): +{gain:.3f} CREDIT"
+              f"  (1 CREDIT ≡ 1 certified J — v0 provisional)")
+    elif already is not None:
+        print("  transition already minted once — no re-mint (grinding guard)")
     else:
-        print(f"\n  challenger {candidate['group']} not certified: interval "
-              f"[{candidate['low']:.3f}, {candidate['high']:.3f}] overlaps holder "
-              f"low {holder['low']:.3f}")
+        print("  frontier updated, NO MINT: "
+              + "; ".join(verdict["mint_reasons"]))
+    print("  " + "=" * 52)
 
 
 # ------------------------------------------------------------------ calibrate
