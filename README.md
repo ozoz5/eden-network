@@ -164,4 +164,6 @@ limitation that EDEN measures *marginal in-window resources*, not
 ## Status
 
 Research prototype, single node, unsigned receipts, simulated mint.
-License: TBD (will be chosen before any announcement).
+Licensed under [Apache-2.0](LICENSE) — the explicit patent grant matters for a
+measurement protocol with a hardware roadmap; the trademark exclusion (§6)
+keeps the EDEN name and future certification marks separate from the code.
