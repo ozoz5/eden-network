@@ -571,6 +571,32 @@ J/success側の真の信頼区間。
 本監査前の実験結果（前線反転・1.5b>7b・リトライ無力）は測定として有効なまま —
 攻撃されたのは数字ではなく、敵対環境での再現保証だった。
 
+### v0実装記録 追補13（2026-08-18 — 第3次監査: C1残穴の即日修正と信頼層への警告）
+
+第3次監査（研究8.5/10・敵対6/10・通貨3/10に上昇）。指摘の中心は
+**「commitments first, THEN randomness」がコメント上の主張でしかなかった**こと —
+乱数取得がenrollmentのDB commitより前にあり、operatorは乱数を見てから
+「epochを開かなかったこと」にできた。正確な指摘で、即日修正:
+
+- **2段階コミット化**: Phase A（epochスタブseed='PENDING'＋enrollmentsを永続化しcommit）→
+  Phase B（外部乱数取得→seed確定をUPDATE）。**中止されたepochはPENDINGスタブとして台帳に残る** —
+  operator grindingは不可能にはならないが、不可視から可視に変わった。epoch_idの導出も
+  seed由来からcommitment由来へ変更（seed確定前にIDが存在する必要があるため）
+- **認証根拠の命名分離**: 「Certified」を success-rate-certified（Wilson区間分離＝統計的根拠）と
+  energy-margin-certified（20%マージン＝**プロトコルパラメータであってCIではない**と明示）に分離。
+  certifyの出力とmints.noteに根拠を記録
+- 完全解（未来のdrand round番号の事前固定＋commitment外部anchor）はPhase 2へ
+
+**残る重い未解決（監査の重要度順に採用）:**
+1. Node/Receipt署名（`"signatures": []` が埋まらない限りNetworkにならない — 最大）
+2. Meter attestation 3. Verifier独立性 4. J/successの真のCI（bootstrap/階層モデル）
+5. operator-grinding耐性乱数 6. family横断換算（経済学上の最大問題）
+将来のtrust_state列（LOCAL/UNSIGNED/SIGNED/ATTESTED/VERIFIED）も採用予定として記録。
+
+**監査の警告を正面から受ける**: 「次に署名を雑に実装すると一気に危なくなる。Trust Layerは
+一番慎重に設計すべき」— 従う。**署名は今夜書かない。** Trust Layerは実装前に設計文書を書き、
+悪魔の代弁者を実装前の設計段階に入れる（監査を後追いから前置きに変える）。
+
 ---
 
 ## 8. 検証済みの外部事実（2026-08-16時点の調査）

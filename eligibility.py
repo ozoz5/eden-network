@@ -176,6 +176,17 @@ def certified_dominates(a, b) -> bool:
     return rate_sep or jps_sep
 
 
+def certification_basis(a, b) -> list:
+    """Which axis certifies the dominance — named honestly: the J/success
+    margin is a protocol parameter, NOT a confidence interval (audit)."""
+    bases = []
+    if a["rate_ci95"][0] >= b["rate_ci95"][1]:
+        bases.append("success-rate-certified (Wilson CI separation)")
+    if a["j_per_success"] <= b["j_per_success"] * (1 - JPS_MARGIN):
+        bases.append("energy-margin-certified (protocol margin, not a CI)")
+    return bases
+
+
 def pareto_frontier(certs) -> list:
     """Non-dominated certs. A cert with zero successes has no J/success and
     can hold no record — it is excluded from membership (audit cosmetic fix:
@@ -224,9 +235,11 @@ def assess_cert_insertion(existing_certs, new_cert) -> dict:
         if gain <= 0:
             mint_reasons.append("no positive J/success improvement")
             gain = 0.0
+    basis = sorted({b for c in certified for b in certification_basis(new_cert, c)})
     return {"eligible": True, "reasons": [], "gain": gain,
             "mintable": not mint_reasons, "mint_reasons": mint_reasons,
-            "dominated": dominated, "pending": rep["pending"]}
+            "dominated": dominated, "certified": certified, "basis": basis,
+            "pending": rep["pending"]}
 
 
 def assess_transition(holder, candidate) -> dict:

@@ -1170,25 +1170,33 @@ def cmd_challenge_open(gen_spec_path: str, runners: list, n: int):
     epoch_no = 1 + conn.execute(
         "SELECT COUNT(*) c FROM epochs WHERE family_id=?", (fam,)
     ).fetchone()["c"]
-    # AUDIT C1: commitments first, THEN randomness that did not exist yet.
+    # AUDIT C1 (3rd pass): commitments must be DURABLE before the randomness
+    # exists — otherwise the operator can peek and "never have opened" the
+    # epoch. Phase A: persist the stub and enrollments, COMMIT. An epoch
+    # abandoned after this point stays visible as a PENDING stub: grinding
+    # now leaves ledger traces instead of vanishing.
     commitment = sha(fam + str(epoch_no)
                      + "|".join(h for _, h in sorted(enrollment)))[:32]
-    rand_source, rand_value = challenge_mod.fetch_external_randomness()
-    seed = challenge_mod.derive_epoch_seed_v2(fam, epoch_no, commitment,
-                                              rand_value)
-    epoch_id = sha(fam + str(epoch_no) + seed)[:16]
-
+    epoch_id = sha(fam + str(epoch_no) + commitment)[:16]
     conn.execute("INSERT INTO epochs(epoch_id, family_id, epoch_no, seed, "
-                 "n_instances, gen_spec_json, created_at, randomness_source, "
-                 "randomness_value, commitment_hash) "
-                 "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                 (epoch_id, fam, epoch_no, seed, n, canonical(spec), now_iso(),
-                  rand_source, rand_value, commitment))
+                 "n_instances, gen_spec_json, created_at, commitment_hash) "
+                 "VALUES (?,?,?,?,?,?,?,?)",
+                 (epoch_id, fam, epoch_no, "PENDING", n, canonical(spec),
+                  now_iso(), commitment))
     for runner, code_hash in enrollment:
         conn.execute("INSERT INTO enrollments VALUES (?,?,?,?)",
                      (epoch_id, runner, code_hash, now_iso()))
-    conn.commit()  # commitments + sealed randomness are durable together
-    print(f"randomness: {rand_source}")
+    conn.commit()
+
+    # Phase B: only now fetch randomness that postdates the durable commit.
+    rand_source, rand_value = challenge_mod.fetch_external_randomness()
+    seed = challenge_mod.derive_epoch_seed_v2(fam, epoch_no, commitment,
+                                              rand_value)
+    conn.execute("UPDATE epochs SET seed=?, randomness_source=?, "
+                 "randomness_value=? WHERE epoch_id=?",
+                 (seed, rand_source, rand_value, epoch_id))
+    conn.commit()
+    print(f"randomness: {rand_source} (fetched after durable commitment)")
 
     correct = (BASE / spec["correct_source"]).read_text()
     test_path = BASE / spec["test_file"]
@@ -1405,6 +1413,7 @@ def cmd_challenge_certify(epoch_prefix: str, commit: bool = False):
         if verdict["mintable"]:
             doms = ", ".join(c["cert_id"] for c in verdict["dominated"])
             print(f"    DOMINATES [{doms}]")
+            print("    basis: " + "; ".join(verdict.get("basis", [])))
             print(f"    MINT (simulated): +{verdict['gain']:.3f} CREDIT "
                   "(1 CREDIT = 1 J-per-success improvement, v0 provisional)")
         else:
@@ -1437,7 +1446,8 @@ def cmd_challenge_certify(epoch_prefix: str, commit: bool = False):
                         (fam, verdict["dominated"][0]["cert_id"],
                          cert["cert_id"], worst, cert["j_per_success"],
                          cert["verify_j"], verdict["gain"],
-                         "SIMULATED-DIST", now_iso()))
+                         "SIMULATED-DIST|" + ";".join(verdict.get("basis", [])),
+                         now_iso()))
             conn.commit()
             existing.append(cert)
     if not commit:
