@@ -505,6 +505,11 @@ def db() -> sqlite3.Connection:
     # Only takes effect when the database is newly created.
     conn.execute("PRAGMA page_size=1024")
     conn.executescript(SCHEMA)
+    for col in ("randomness_source", "randomness_value", "commitment_hash"):
+        try:
+            conn.execute(f"ALTER TABLE epochs ADD COLUMN {col} TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
     return conn
 
 
@@ -530,6 +535,11 @@ def family_id_of(spec: dict) -> str:
             verifier_spec_hash(spec),
             spec["input_schema"],
             "code-fix",
+            spec.get("bug_mode", "token"),                      # audit C3
+            challenge_mod.generator_fingerprint(),               # audit C3
+            sha((BASE / spec["correct_source"]).read_bytes())[:16]
+            if "correct_source" in spec else
+            sha((BASE / spec["source_file"]).read_bytes())[:16],
             spec["quality"]["type"],
             spec["resource_boundary_profile"],
         ])
@@ -541,6 +551,7 @@ def family_id_of(spec: dict) -> str:
             verifier_spec_hash(spec),
             spec["input_schema"],
             canonical(gen),
+            sha(inspect.getsource(generate_corpus))[:16],        # audit C3
             spec["quality"]["type"],
             spec["resource_boundary_profile"],
         ])
@@ -850,6 +861,8 @@ def cmd_import(path: str):
         added += cur.rowcount
     conn.commit()
     print(f"imported {added} foreign receipts ({len(payload) - added} already known)")
+    print("status: QUARANTINED — stored as unsigned claims, excluded from "
+          "frontier/certification until signature+attestation exist (audit C2)")
 
 
 def cmd_receipt_show(run_id_prefix: str):
@@ -873,8 +886,11 @@ def group_stats(conn, family_id: str):
     just the ledger read plus delegation.
     """
     rows = conn.execute(
-        "SELECT receipt_json FROM receipts WHERE family_id=?", (family_id,)
+        "SELECT receipt_json FROM receipts WHERE family_id=? "
+        "AND run_id NOT LIKE 'ext-%'", (family_id,)
     ).fetchall()
+    # AUDIT C2: unsigned foreign receipts are stored as observation claims
+    # but never feed the frontier until signatures/attestation exist.
     return eligibility.group_stats([json.loads(r["receipt_json"]) for r in rows])
 
 
@@ -1154,17 +1170,25 @@ def cmd_challenge_open(gen_spec_path: str, runners: list, n: int):
     epoch_no = 1 + conn.execute(
         "SELECT COUNT(*) c FROM epochs WHERE family_id=?", (fam,)
     ).fetchone()["c"]
-    recent = [r["receipt_hash"] for r in conn.execute(
-        "SELECT receipt_hash FROM receipts ORDER BY created_at DESC LIMIT 100")]
-    seed = challenge_mod.derive_epoch_seed(fam, epoch_no, recent)
+    # AUDIT C1: commitments first, THEN randomness that did not exist yet.
+    commitment = sha(fam + str(epoch_no)
+                     + "|".join(h for _, h in sorted(enrollment)))[:32]
+    rand_source, rand_value = challenge_mod.fetch_external_randomness()
+    seed = challenge_mod.derive_epoch_seed_v2(fam, epoch_no, commitment,
+                                              rand_value)
     epoch_id = sha(fam + str(epoch_no) + seed)[:16]
 
-    conn.execute("INSERT INTO epochs VALUES (?,?,?,?,?,?,?)",
-                 (epoch_id, fam, epoch_no, seed, n, canonical(spec), now_iso()))
+    conn.execute("INSERT INTO epochs(epoch_id, family_id, epoch_no, seed, "
+                 "n_instances, gen_spec_json, created_at, randomness_source, "
+                 "randomness_value, commitment_hash) "
+                 "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                 (epoch_id, fam, epoch_no, seed, n, canonical(spec), now_iso(),
+                  rand_source, rand_value, commitment))
     for runner, code_hash in enrollment:
         conn.execute("INSERT INTO enrollments VALUES (?,?,?,?)",
                      (epoch_id, runner, code_hash, now_iso()))
-    conn.commit()  # commitments are durable before any instance exists
+    conn.commit()  # commitments + sealed randomness are durable together
+    print(f"randomness: {rand_source}")
 
     correct = (BASE / spec["correct_source"]).read_text()
     test_path = BASE / spec["test_file"]
@@ -1321,6 +1345,26 @@ def cmd_challenge_certify(epoch_prefix: str, commit: bool = False):
     if not aggs:
         sys.exit(f"error: epoch {eid} has no runs (run: eden challenge run)")
 
+    # AUDIT H7 (v0 single-node guard): refuse to certify epochs whose
+    # receipts span multiple hardware fingerprints — cross-node certs need
+    # per-node stratification that v0 does not implement yet.
+    hw_rows = conn.execute(
+        """SELECT DISTINCT json_extract(rc.receipt_json,
+                  '$.hardware_profile.platform') AS hp
+           FROM epoch_runs er JOIN receipts rc ON rc.run_id = er.run_id
+           WHERE er.epoch_id=?""", (eid,)).fetchall()
+    if len(hw_rows) > 1:
+        sys.exit(f"error: epoch {eid} spans {len(hw_rows)} hardware profiles "
+                 "— multi-node certification is not implemented (audit H7)")
+
+    coverage = {r["runner_id"]: r["covered"] for r in conn.execute(
+        """SELECT runner_id, COUNT(DISTINCT instance_index) AS covered
+           FROM epoch_runs WHERE epoch_id=? GROUP BY runner_id""", (eid,))}
+    enrolled_hashes = {r["runner_id"]: r["runner_code_hash"]
+                       for r in conn.execute(
+        "SELECT runner_id, runner_code_hash FROM enrollments WHERE epoch_id=?",
+        (eid,))}
+
     existing = [_cert_row_to_dict(r) for r in conn.execute(
         "SELECT * FROM distribution_certs WHERE family_id=? ORDER BY created_at",
         (fam,))]
@@ -1331,6 +1375,21 @@ def cmd_challenge_certify(epoch_prefix: str, commit: bool = False):
             epoch["n_instances"], a["attempts"], a["successes"] or 0,
             a["run_j"], a["verify_j"])
         verdict = eligibility.assess_cert_insertion(existing, cert)
+        # AUDIT H5: a certificate must prove it faced every issued instance
+        # with the exact code it committed at enrollment.
+        cov = coverage.get(a["runner_id"], 0)
+        if cov < epoch["n_instances"]:
+            verdict = {"eligible": False, "gain": 0.0, "mintable": False,
+                       "mint_reasons": [], "dominated": [],
+                       "pending": verdict.get("pending", []),
+                       "reasons": [f"instance coverage {cov}/"
+                                   f"{epoch['n_instances']} (audit H5)"]}
+        elif enrolled_hashes.get(a["runner_id"]) != a["runner_code_hash"]:
+            verdict = {"eligible": False, "gain": 0.0, "mintable": False,
+                       "mint_reasons": [], "dominated": [],
+                       "pending": verdict.get("pending", []),
+                       "reasons": ["run code hash differs from enrollment "
+                                   "commitment (audit H5)"]}
         jps = ("inf" if cert["j_per_success"] == float("inf")
                else f"{cert['j_per_success']:.3f}")
         print(f"\n  {cert['cert_id']}")

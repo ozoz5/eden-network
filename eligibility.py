@@ -156,6 +156,26 @@ def dominates(a, b) -> bool:
     return ge and strict
 
 
+JPS_MARGIN = 0.2   # provisional J/success margin until per-cert energy
+                   # intervals exist (audit H4: energy has meter noise too)
+
+
+def certified_dominates(a, b) -> bool:
+    """Uncertainty-aware dominance (audit H4). Point-estimate Pareto is the
+    OBSERVED frontier; minting demands more: no-worse on both axes AND
+    clearly-better beyond uncertainty on at least one — Wilson-interval
+    separation on success rate, or a declared margin on J/success."""
+    if a["meter"] != b["meter"] or b["successes"] == 0:
+        return False
+    rate_ge = a["success_rate"] >= b["success_rate"]
+    jps_le = a["j_per_success"] <= b["j_per_success"]
+    if not (rate_ge and jps_le):
+        return False
+    rate_sep = a["rate_ci95"][0] >= b["rate_ci95"][1]
+    jps_sep = a["j_per_success"] <= b["j_per_success"] * (1 - JPS_MARGIN)
+    return rate_sep or jps_sep
+
+
 def pareto_frontier(certs) -> list:
     """Non-dominated certs. A cert with zero successes has no J/success and
     can hold no record — it is excluded from membership (audit cosmetic fix:
@@ -181,12 +201,16 @@ def assess_cert_insertion(existing_certs, new_cert) -> dict:
                 "dominated": [], "pending": rep["pending"]}
     prior_frontier = pareto_frontier(existing_certs)
     dominated = [c for c in prior_frontier if dominates(new_cert, c)]
+    certified = [c for c in dominated if certified_dominates(new_cert, c)]
     mint_reasons = []
-    finite = [c for c in dominated
+    finite = [c for c in certified
               if c["j_per_success"] != float("inf")]
     if not dominated:
         mint_reasons.append("no prior frontier cert dominated (genesis or "
                             "non-dominating entry)")
+    elif not certified:
+        mint_reasons.append("observed domination only — not certified "
+                            "(CI overlap / within J-margin, audit H4)")
     elif not finite:
         mint_reasons.append("dominated certs have no finite J/success — "
                             "no measurable improvement to price")

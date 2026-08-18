@@ -536,7 +536,40 @@ rules           0/12   ∞                       0/12  ∞
   検出をテストで実証。**chain headは公開gitのコミットメッセージへ焼き込み、git履歴を外部アンカーとする**
 - 0成功certの前線表示問題を解消（空メーター層は「無限の前線」を持たない、テスト付き）
 - テスト52本。2026-08-18時点のchain head: 4bf1aa201b16c386f8423048daeb0643ec6baac4b316e9156111081bda7bf6e9
-  （147レシート、verdict: INTACT）
+  （147レシート、verdict: INTACT）※「52本」は数え間違いで実数は51本（追補12で訂正）
+
+### v0実装記録 追補12（2026-08-18 — 第2次外部監査: 敵対的プロトコルとしての穴）
+
+外部監査（研究プロトタイプ8/10・敵対的ネットワーク4/10・実通貨基盤2/10）の生存判定と同日修正。
+全指摘が現行コードと一致する正確な監査だった。
+
+**同日修正（CRITICAL×3＋HIGH×2＋MEDIUM×2）:**
+- **C1 Challenge事前予測可能** → seed v2: H(family | epoch | enrollment commitment | **commit後に取得する
+  外部乱数**)。乱数源はdrand(Cloudflareミラー)→NIST beacon→operator-local urandomの順で取得し、
+  源と値をepochへ記録。fallbackは「参加者には予測不能・operatorは信頼前提」と偽装なく宣言。
+  旧seed導出はv1として保存（過去epochの再計算可能性、憲法IV）
+- **C2 無署名importが前線材料** → 検疫: `ext-`レシートは観測クレームとして保存されるが、
+  frontier/certificationの入力から除外。署名+attestation実装までQUARANTINED
+- **C3 familyが分布をコミットしない** → family材料にbug_mode・generator_fingerprint（注入コード＋
+  語彙表のhash）・基材ソースhashを追加。**分布が変われば原則familyが変わる**。既存familyのIDは
+  変わる（新familyとして再出発、旧前線は履歴。verifier変更時と同じ扱い）
+- **H4 点推定Pareto** → 二層化: Observed frontier（点推定）とCertified（Wilson区間分離 or
+  J/successマージン20%）。**mintはCertifiedのみ**。マージンはcertごとのエネルギー区間が
+  できるまでの暫定と宣言
+- **H5 coverage未証明** → certify時に COUNT(DISTINCT instance_index)==n_instances と
+  全runのcode hash==enrollment hashを検証
+- **H7 cert集約にhardware不在** → v0ガード: epochのレシートが複数hardware指紋に跨る場合は
+  certify拒否（クロスノード認証は未実装と明示）
+- **M8 会計境界の言い切り** → README: 「EDEN measures marginal in-window execution cost」と限定
+- **M9 ORE市場価値** → 「二次市場価値が生じてもプロトコルは保証しない」を仕様に明記
+
+**未修正（設計判断・順序どおり次へ）:** H6のoperator grinding完全排除（epoch開設タイミングの
+選択権はoperatorに残る — round事前コミット等はPhase 2）、署名/attestation本体（⑥）、
+J/success側の真の信頼区間。
+
+**監査の総括への同意**: 「研究として強いが、信用を置くにはまだ危険」は正確な現在地。
+本監査前の実験結果（前線反転・1.5b>7b・リトライ無力）は測定として有効なまま —
+攻撃されたのは数字ではなく、敵対環境での再現保証だった。
 
 ---
 

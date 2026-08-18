@@ -15,6 +15,10 @@ Constitutional separation (§6.7): ORE carries NO economic fields, converts
 to no CREDIT, grants no priority, stakes nothing. Economy for the machines,
 play for the humans. This module must never import eligibility.
 
+If a secondary market ever assigns value to OREs, the protocol does not
+recognize or guarantee it (audit M9): sealing-epoch timing is operator-
+influenced, so ORE randomness must never be treated as economically fair.
+
 Rarity by leading zero bits of the discovery hash:
     SPARK >= 6   (~1/64)
     VEIN  >= 10  (~1/1024)

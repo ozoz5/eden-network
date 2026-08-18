@@ -48,9 +48,58 @@ SEMANTIC_BUGS = [
 
 
 def derive_epoch_seed(family_id: str, epoch_no: int, receipt_hashes) -> str:
-    """Seed = H(family | epoch | recent ledger receipts). Recomputable."""
+    """v1 seed (kept for old epochs' recomputability). AUDIT C1: everything
+    in this material is knowable BEFORE enrollment, so instances were
+    precomputable by participants. Superseded by derive_epoch_seed_v2."""
     material = family_id + "|" + str(epoch_no) + "|" + "|".join(receipt_hashes)
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def derive_epoch_seed_v2(family_id: str, epoch_no: int,
+                         commitment_hash: str, randomness_value: str) -> str:
+    """Seed = H(family | epoch | enrollment commitments | POST-COMMIT
+    randomness). The randomness is fetched after commitments are durable and
+    comes from an external beacon when reachable, so participants cannot
+    precompute instances and tailor runners to them (audit C1)."""
+    material = "|".join([family_id, str(epoch_no), commitment_hash,
+                         randomness_value])
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def fetch_external_randomness(timeout: int = 6):
+    """drand (Cloudflare mirror) -> NIST beacon -> operator-local fallback.
+
+    Returns (source, value). The fallback is unpredictable to participants
+    but trusted to the operator — recorded as such, never disguised."""
+    import json as _json
+    import urllib.request
+    for source, url, extract in (
+        ("drand-cloudflare",
+         "https://drand.cloudflare.com/public/latest",
+         lambda d: f"round:{d['round']}:{d['signature']}"),
+        ("nist-beacon",
+         "https://beacon.nist.gov/beacon/2.0/pulse/last",
+         lambda d: f"pulse:{d['pulse']['chainIndex']}:{d['pulse']['pulseIndex']}:{d['pulse']['outputValue']}"),
+    ):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as r:
+                data = _json.loads(r.read().decode())
+            return source, extract(data)
+        except Exception:
+            continue
+    import os
+    return ("operator-local-urandom (participant-unpredictable, "
+            "operator-trusted)", os.urandom(32).hex())
+
+
+def generator_fingerprint() -> str:
+    """AUDIT C3: the distribution IS the frontier's identity, so the family
+    must commit to the generator — its code and its bug vocabularies."""
+    import inspect
+    material = (inspect.getsource(inject_bug)
+                + inspect.getsource(inject_semantic_bug)
+                + repr(BUG_OPS) + repr(SEMANTIC_BUGS))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
 
 def _tests_fail(source: str, test_path, module_name: str) -> bool:

@@ -253,9 +253,14 @@ trigger a mint lives in one auditable module, [`eligibility.py`](eligibility.py)
   re-hashes every receipt body and every link. Edits are not impossible on
   a single node — they are *detectable*, and the chain head is anchored in
   this repository's public commit history.
+- **Scope of the claim** (audit M8): EDEN measures *marginal in-window
+  execution cost*. Challenge generation, model loads, warm-ups, downloads,
+  idle power and the meter itself live outside the window — declared, not
+  hidden. "Total physical resources" would be an overclaim.
 - The cultural layer: `eden ore scan` — receipts are sealed by the seed of
   the first epoch opened after them (unchoosable randomness); rare hashes
-  are OREs. No economic linkage, by constitution and by test.
+  are OREs. No economic linkage, by constitution and by test. If OREs ever
+  acquire market value, the protocol does not guarantee their fairness.
 - `eden html` renders the ledger — frontiers, mints, ores — as one page.
 
 ### Level V setup (macOS, optional)
