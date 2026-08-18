@@ -280,3 +280,73 @@ chain(seq, entry_type, entry_id UNIQUE, entry_hash, prev_chain, chain_hash, chai
 §9.5-3で推奨した事前署名済み失効宣言は、鍵と同じ場所に置けば同時に盗まれ、
 別の場所に置けば紛失リスクが増える。v0.5では推奨に留め、保管方式は規定しない
 （規定できないことを規定しない）。
+
+---
+
+## 10. Journalのdomain separation と、規則の版管理（2026-08-19）
+
+第4次監査の指摘: 署名ではnamespace分離を採用したのに、journalのhashには適用していない
+（原則の適用漏れ）。実測で衝突経路を確認した上で採用する。
+
+### 10.1 衝突は実在する（実測）
+
+```text
+checkpoint body = {"chain_head":"abc123","node_id":"n1"}
+revocation body = {"chain_head":"abc123","node_id":"n1"}
+→ canonical一致 → SHA256一致（211b2ccc...）
+```
+
+異種entryが同じバイト列になれば、**「何であるか」を偽装できる**。
+domain separationで分離する:
+
+```text
+entry_hash = SHA256("EDEN:" + entry_type + ":v1|" + canonical_bytes)
+```
+
+区切り文字の偽装は成立しない（実測）: canonical JSONは必ず `{` で始まり、
+body内の `|` や domain文字列は JSON文字列としてescapeされるため、
+`domain + "|" + "{"` という構造は不変。
+
+### 10.2 これが暴いた、より重い問題 — 既存chainの再計算不能性
+
+domain separationを導入すると `entry_hash` の計算規則が変わる。
+既存147件は `entry_hash = receipt_hash`（domain無し）で連鎖しており、
+新規則を遡及適用すると **chain全体が再計算され、gitに焼いた head
+`4bf1aa20...` が無効になる**。それは公開済みの事実の破壊であり、憲法IV違反。
+
+**解: 規則に版を持たせ、事実には触らない。**
+
+```text
+chain(seq, entry_type, entry_id, entry_hash, hash_rule, prev_chain, chain_hash, ...)
+
+hash_rule = "v1-legacy"   seq 1..147   entry_hash = receipt_hash（domain無し）
+hash_rule = "v2-domain"   seq 148..    entry_hash = SHA256(domain|canonical)
+```
+
+- 各entryは**自分がどの規則で作られたか**を持つ。検証は entry の hash_rule に従って行う
+- 過去のchain_hashは一切変わらない。gitアンカーは有効なまま
+- これは憲法IVの逐語的実装: **事実（過去のhash）は不変、規則（計算方法）は版を持つ**
+
+### 10.3 規則変更そのものをjournalに刻む
+
+版が変わる境界を、後から「そう言っているだけ」にしない:
+
+```text
+entry_type = "rule_change"
+body = {from_seq: 148, field: "entry_hash", old_rule: "v1-legacy",
+        new_rule: "v2-domain", reason: "domain separation (audit 4)"}
+```
+
+この entry 自体が seq を持ち、chainに刻まれ、以降のanchorで外部固定される。
+**プロトコルが自分の規則変更を自分の台帳へ記録する** — 規則の履歴もまた観測事実になる。
+
+### 10.4 実装順序への影響（Phase A改訂）
+
+1. chain汎用journal化（列追加 + hash_rule='v1-legacy' を既存147件へ）
+2. rule_change entry を刻む（seq 148）
+3. 以降のentryを v2-domain で連鎖
+4. checkpoint署名 → git anchor（新regimeを外部固定）
+5. その後に identity / emit署名
+
+**1〜4を署名より先に済ませる。** 署名entryが v1-legacy 規則で刻まれてしまうと、
+以後ずっと2規則が混在したままになる。
