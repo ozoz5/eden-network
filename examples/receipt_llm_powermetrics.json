@@ -1,0 +1,52 @@
+{
+    "energy_boundary": "system-package power (CPU+GPU+ANE) minus measured idle baseline; exclusive use assumed",
+    "family_id": "13679fc42b47c092",
+    "hardware_profile": {
+        "machine": "arm64",
+        "platform": "macOS-26.5.1-arm64-arm-64bit-Mach-O"
+    },
+    "input_hash": "c198f3937ff4bbac",
+    "measurement_profile": {
+        "assigned_cv": 0.1,
+        "confidence": 0.7,
+        "fallback_to_estimated": false,
+        "interval_ms": 100,
+        "mean_active_mw": 27349.2,
+        "mean_idle_mw": 3258.5,
+        "meter_profile_id": "powermetrics-package-v1",
+        "method": "os-counter",
+        "n_samples_active": 58,
+        "n_samples_idle": 2,
+        "preroll_s": 0.5,
+        "raw_observable": "powermetrics Combined Power (CPU+GPU+ANE) mW @ 100ms + child cpu_seconds"
+    },
+    "meter_id": "powermetrics-package-v1",
+    "output_hash": "6b6646437ba9e839",
+    "receipt_version": "eden-receipt/2",
+    "result": {
+        "quality_metric": "tests-pass",
+        "score": 1.0,
+        "status": "PASS"
+    },
+    "run_energy": {
+        "cpu_seconds": 0.162298,
+        "energy_joules": 158.8510058229356,
+        "wall_seconds": 6.593865959090181
+    },
+    "runner_code_hash": "965741328a0fc470",
+    "runner_id": "codefix_llm",
+    "signatures": [],
+    "task_contract_version": "code-fix/1",
+    "task_instance_id": "04c76eaf9a68d244",
+    "timestamp": "2026-08-17T15:13:43+00:00",
+    "uncertainty_profile": {
+        "assigned_cv": 0.1,
+        "assignment": "protocol-assigned per meter profile; group sigma replaces it when >=3 replications exist"
+    },
+    "verification_energy": {
+        "cpu_seconds": 0.034461000000000075,
+        "energy_joules": 0.20676600000000045
+    },
+    "verifier_id": "unittest-v1",
+    "verifier_spec_hash": "66240de920d620ab"
+}

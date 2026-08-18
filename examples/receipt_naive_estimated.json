@@ -1,0 +1,46 @@
+{
+    "energy_boundary": "single-process/child-cpu/incl-interpreter-startup",
+    "family_id": "5cb6812f2b301d90",
+    "hardware_profile": {
+        "machine": "arm64",
+        "platform": "macOS-26.5.1-arm64-arm-64bit-Mach-O"
+    },
+    "input_hash": "2061607c199e0496",
+    "measurement_profile": {
+        "assigned_cv": 0.15,
+        "confidence": 0.4,
+        "meter_profile_id": "estimated-cpu-v1",
+        "method": "estimated",
+        "raw_observable": "child_cpu_seconds (getrusage RUSAGE_CHILDREN)",
+        "watts_per_cpu_second_assumed": 6.0
+    },
+    "meter_id": "estimated-cpu-v1",
+    "output_hash": "fb20f462ac26cbb1",
+    "receipt_version": "eden-receipt/2",
+    "result": {
+        "quality_metric": "exact-match",
+        "score": 1.0,
+        "status": "PASS"
+    },
+    "run_energy": {
+        "cpu_seconds": 0.957452,
+        "energy_joules": 5.744712,
+        "wall_seconds": 0.9607892089989036
+    },
+    "runner_code_hash": "98defeb1aeca6cd8",
+    "runner_id": "naive_count",
+    "signatures": [],
+    "task_contract_version": "topk-words/1",
+    "task_instance_id": "4180ec37b072ccec",
+    "timestamp": "2026-08-16T05:44:27+00:00",
+    "uncertainty_profile": {
+        "assigned_cv": 0.15,
+        "assignment": "protocol-assigned per meter profile; group sigma replaces it when >=3 replications exist"
+    },
+    "verification_energy": {
+        "cpu_seconds": 0.045771000000000006,
+        "energy_joules": 0.27462600000000004
+    },
+    "verifier_id": "ref-exact-v1",
+    "verifier_spec_hash": "11ccbf6263e68869"
+}

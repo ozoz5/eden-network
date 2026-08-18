@@ -193,7 +193,8 @@ class PowermetricsAdapter(MeasurementAdapter):
     BOUNDARY = ("system-package power (CPU+GPU+ANE) minus measured idle "
                 "baseline; exclusive use assumed")
     INTERVAL_MS = 100
-    PREROLL_S = 0.5
+    MIN_IDLE_SAMPLES = 5   # audit fix: 0.5s preroll landed only 2 samples
+    PREROLL_MAX_S = 2.0
 
     def _reader(self):
         try:
@@ -216,7 +217,12 @@ class PowermetricsAdapter(MeasurementAdapter):
         )
         self._thread = threading.Thread(target=self._reader, daemon=True)
         self._thread.start()
-        time.sleep(self.PREROLL_S)
+        # Adaptive preroll: wait for a real idle baseline, not a fixed sleep.
+        deadline = time.monotonic() + self.PREROLL_MAX_S
+        while (len(self._samples) < self.MIN_IDLE_SAMPLES
+               and time.monotonic() < deadline
+               and self._proc.poll() is None):
+            time.sleep(0.05)
         if self._proc.poll() is not None:
             sys.exit("error: powermetrics unavailable. Grant passwordless "
                      "sudo:\n  echo \"$USER ALL=(ALL) NOPASSWD: "
@@ -262,19 +268,23 @@ class PowermetricsAdapter(MeasurementAdapter):
     def method(self): return "estimated" if self._fallback else self.METHOD
 
     def profile(self) -> dict:
+        # Audit fix: a fallback measurement is an ESTIMATED measurement and
+        # must carry a distinct profile id so grouping never mixes it with
+        # real package-power receipts.
         return {
-            "meter_profile_id": self.PROFILE_ID,
+            "meter_profile_id": ("estimated-cpu-pmfallback-v1" if self._fallback
+                                 else self.PROFILE_ID),
             "method": self.method(),
             "raw_observable": "powermetrics Combined Power (CPU+GPU+ANE) mW "
                               f"@ {self.INTERVAL_MS}ms + child cpu_seconds",
             "interval_ms": self.INTERVAL_MS,
-            "preroll_s": self.PREROLL_S,
             "mean_active_mw": round(self._mean_active, 1),
             "mean_idle_mw": round(self._mean_idle, 1),
             "n_samples_active": len(self._active),
             "n_samples_idle": len(self._idle),
             "fallback_to_estimated": self._fallback,
-            "assigned_cv": self.ASSIGNED_CV,
+            "assigned_cv": (EstimatedCpuAdapter.ASSIGNED_CV if self._fallback
+                            else self.ASSIGNED_CV),
             "confidence": self.confidence(),
         }
 
@@ -282,7 +292,7 @@ class PowermetricsAdapter(MeasurementAdapter):
 def powermetrics_available() -> bool:
     try:
         r = subprocess.run(
-            ["sudo", "-n", "/usr/bin/powermetrics", "-n", "1", "-i", "50",
+            ["sudo", "-n", "/usr/bin/powermetrics", "-i", "100", "-n", "1",
              "--samplers", "cpu_power"],
             capture_output=True, timeout=10,
         )
@@ -546,7 +556,8 @@ def cmd_run(task_prefix: str, runner: str, repeat: int, chain: bool = True,
             except json.JSONDecodeError:
                 status = "ERROR"
         run_id = sha(task["task_instance_id"] + runner + started + str(i)
-                     + str(result["cpu_seconds"]))[:16]
+                     + str(result["cpu_seconds"])
+                     + str(time.monotonic_ns()))[:16]
         conn.execute(
             "INSERT INTO runs VALUES (?,?,?,?,?,?,?,?,?)",
             (run_id, task["task_instance_id"], runner, runner_hash,
@@ -588,7 +599,14 @@ def cmd_verify(run_id_prefix: str, conn=None) -> str:
     spec = json.loads(task["spec_json"])
 
     # Verification is real work in a measured child process, so verification
-    # energy is observed (§III).
+    # energy is observed (§III). Audit fix: verify with the SAME meter class
+    # as the run, so Constitution III never subtracts across meter scales.
+    m = conn.execute(
+        "SELECT method FROM measurements WHERE run_id=?", (run["run_id"],)
+    ).fetchone()
+    v_meter = ("powermetrics" if (m and m["method"] == "os-counter"
+                                  and powermetrics_available()) else "estimated")
+
     if spec.get("task_type") == "code-fix":
         verifier_id = VERIFIER_ID_TESTS
         status, result = "FAIL", None
@@ -600,7 +618,7 @@ def cmd_verify(run_id_prefix: str, conn=None) -> str:
                 shutil.copy(test_path, Path(td) / test_path.name)
                 result = run_measured(
                     [sys.executable, "-m", "unittest", test_path.stem, "-v"],
-                    cwd=td,
+                    cwd=td, meter=v_meter,
                 )
             status = "PASS" if result["returncode"] == 0 else "FAIL"
         if result is None:  # runner produced nothing verifiable
@@ -609,7 +627,8 @@ def cmd_verify(run_id_prefix: str, conn=None) -> str:
         verifier_id = VERIFIER_ID
         result = run_measured(
             [sys.executable, str(BASE / "eden.py"), "_refverify",
-             task["input_path"], str(spec["k"])]
+             task["input_path"], str(spec["k"])],
+            meter=v_meter,
         )
         expected = canonical(json.loads(result["stdout"]))
         status = ("PASS" if (run["output_json"] == expected
@@ -692,10 +711,21 @@ def build_receipt(conn, run_id: str):
         "signatures": [],
     }
     # §2.1 invariant: economic interpretation must never enter a receipt.
-    flat = canonical(receipt)
-    for key in FORBIDDEN_RECEIPT_KEYS:
-        assert f'"{key}' not in flat, f"forbidden field '{key}' in receipt"
+    # Audit fix: raise (assert vanishes under -O) and match KEY NAMES exactly
+    # (substring matching crashed on legitimate values like runner_id="baseline").
+    _check_forbidden(receipt)
     return receipt
+
+
+def _check_forbidden(obj, path="receipt"):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in FORBIDDEN_RECEIPT_KEYS:
+                raise ValueError(f"forbidden field '{path}.{k}' in receipt (§2.1)")
+            _check_forbidden(v, f"{path}.{k}")
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            _check_forbidden(v, f"{path}[{i}]")
 
 
 def cmd_receipt_emit(run_id_prefix: str, conn=None, quiet=False):
@@ -738,10 +768,16 @@ def cmd_receipt_show(run_id_prefix: str):
 # ------------------------------------------------------------------- frontier
 
 def group_stats(conn, family_id: str):
-    """Frontier input = receipts only (Constitution I). Grouped by runner.
+    """Frontier input = receipts only (Constitution I).
 
-    A group is a replication set (same runner solution). Sigma of the mean
-    shrinks with sqrt(n) (設計書 §3: interval narrowing through replication).
+    Audit fixes (2026-08-18):
+    - Groups are stratified by (runner_id, meter_id): receipts measured on
+      different meter boundaries are different physical scales and must never
+      share a sigma.
+    - Replication (sqrt(n)) narrows only MEASURED sigma (n >= 3). The
+      protocol-assigned cv is a systematic uncertainty and does not average
+      out, so it is used at full width regardless of n.
+    - Interval lower bounds are clamped at 0 (energy cannot be negative).
     """
     rows = conn.execute(
         "SELECT receipt_json FROM receipts WHERE family_id=?", (family_id,)
@@ -749,30 +785,46 @@ def group_stats(conn, family_id: str):
     groups = {}
     for r in rows:
         rec = json.loads(r["receipt_json"])
-        g = groups.setdefault(rec["runner_id"], {"e": [], "v": [], "cv": None})
+        key = (rec["runner_id"], rec["meter_id"])
+        g = groups.setdefault(key, {"e": [], "v": [], "cv": 0.0})
         g["e"].append(rec["run_energy"]["energy_joules"])
         g["v"].append(rec["verification_energy"]["energy_joules"])
-        g["cv"] = rec["uncertainty_profile"]["assigned_cv"]
+        g["cv"] = max(g["cv"], rec["uncertainty_profile"]["assigned_cv"])
     out = []
-    for key, g in groups.items():
+    for (runner, meter), g in groups.items():
         n = len(g["e"])
         mean = sum(g["e"]) / n
         if n >= 3:
             var = sum((x - mean) ** 2 for x in g["e"]) / (n - 1)
             sigma = var ** 0.5
+            half = K_SIGMA * sigma / (n ** 0.5)
         else:
-            sigma = g["cv"] * mean  # protocol-assigned fallback
-        sem = sigma / (n ** 0.5)
+            sigma = g["cv"] * mean  # systematic: no sqrt(n) reduction
+            half = K_SIGMA * sigma
         out.append({
-            "group": key, "n": n, "mean": mean, "sigma": sigma,
-            "low": mean - K_SIGMA * sem, "high": mean + K_SIGMA * sem,
+            "group": f"{runner}@{meter}", "runner": runner, "meter": meter,
+            "n": n, "mean": mean, "sigma": sigma,
+            "low": max(0.0, mean - half), "high": mean + half,
             "verify_mean": sum(g["v"]) / n,
         })
     out.sort(key=lambda g: g["high"])
     return out
 
 
-def cmd_frontier(task_prefix: str):
+def _set_state(conn, fam, g):
+    conn.execute(
+        "INSERT INTO frontier_state VALUES (?,?,?,?,?,?,?) "
+        "ON CONFLICT(family_id) DO UPDATE SET group_key=excluded.group_key, "
+        "n=excluded.n, mean_j=excluded.mean_j, low_j=excluded.low_j, "
+        "high_j=excluded.high_j, updated_at=excluded.updated_at",
+        (fam, g["group"], g["n"], g["mean"], g["low"], g["high"], now_iso()),
+    )
+
+
+def cmd_frontier(task_prefix: str, commit: bool = False):
+    """Analysis is read-only by default. --commit mutates frontier_state/mints
+    (audit fix: issuance must be an explicit act, not a side effect of asking).
+    """
     conn = db()
     task = resolve_task(conn, task_prefix)
     fam = task["family_id"]
@@ -781,10 +833,13 @@ def cmd_frontier(task_prefix: str):
         print(f"family {fam}: no receipts yet. frontier is empty.")
         return
 
-    print(f"family {fam}  (verified receipt groups, interval = mean ± {K_SIGMA:g}σ/√n)")
+    print(f"family {fam}  (groups = runner@meter; assigned-cv intervals do not "
+          f"shrink with n)")
     for g in groups:
-        print(f"  {g['group']:<14} n={g['n']:<3} E={g['mean']:8.3f} J  "
+        print(f"  {g['group']:<40} n={g['n']:<3} E={g['mean']:8.3f} J  "
               f"[{g['low']:.3f}, {g['high']:.3f}]  ρ={g['verify_mean']/g['mean']:.2f}")
+    if not commit:
+        print("\n  (analysis only — use --commit to update frontier state / mint)")
 
     candidate = groups[0]
     state = conn.execute(
@@ -792,31 +847,34 @@ def cmd_frontier(task_prefix: str):
     ).fetchone()
 
     if state is None:
-        conn.execute(
-            "INSERT INTO frontier_state VALUES (?,?,?,?,?,?,?)",
-            (fam, candidate["group"], candidate["n"], candidate["mean"],
-             candidate["low"], candidate["high"], now_iso()),
-        )
+        if not commit:
+            return
+        _set_state(conn, fam, candidate)
         conn.commit()
         print()
         print("  " + "=" * 52)
         print(f"  FIRST RECORD   family={fam}")
         print(f"  {candidate['group']}: {candidate['mean']:.3f} J  "
               f"[{candidate['low']:.3f}, {candidate['high']:.3f}]  n={candidate['n']}")
+        print("  (unaudited genesis — mint baseline integrity is an open "
+              "problem, see 設計書 §6)")
         print("  " + "=" * 52)
         return
 
     holder = next((g for g in groups if g["group"] == state["group_key"]), None)
     if holder is None:
-        holder = candidate
+        # Audit fix: the recorded holder group no longer exists in the ledger.
+        # Re-establish state explicitly instead of silently corrupting it.
+        print(f"\n  frontier holder '{state['group_key']}' has no receipts; "
+              f"re-establishing record at {candidate['group']}")
+        if commit:
+            _set_state(conn, fam, candidate)
+            conn.commit()
+        return
     if candidate["group"] == holder["group"]:
-        conn.execute(
-            "UPDATE frontier_state SET n=?, mean_j=?, low_j=?, high_j=?, updated_at=? "
-            "WHERE family_id=?",
-            (holder["n"], holder["mean"], holder["low"], holder["high"],
-             now_iso(), fam),
-        )
-        conn.commit()
+        if commit:
+            _set_state(conn, fam, holder)
+            conn.commit()
         print(f"\n  frontier unchanged: {holder['group']} "
               f"[{holder['low']:.3f}, {holder['high']:.3f}] J")
         return
@@ -824,42 +882,55 @@ def cmd_frontier(task_prefix: str):
     # Certified dominance (§3): challenger high must clear holder low.
     if candidate["high"] < holder["low"]:
         gain = max(0.0, holder["low"] - candidate["high"] - candidate["verify_mean"])
-        conn.execute(
-            "INSERT INTO mints(family_id, prev_group, new_group, prev_low_j, "
-            "new_high_j, verify_energy_j, certified_gain_j, note, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
-            (fam, holder["group"], candidate["group"], holder["low"],
-             candidate["high"], candidate["verify_mean"], gain,
-             "SIMULATED", now_iso()),
-        )
-        conn.execute(
-            "UPDATE frontier_state SET group_key=?, n=?, mean_j=?, low_j=?, "
-            "high_j=?, updated_at=? WHERE family_id=?",
-            (candidate["group"], candidate["n"], candidate["mean"],
-             candidate["low"], candidate["high"], now_iso(), fam),
-        )
+        if not commit:
+            print(f"\n  would certify: {candidate['group']} dominates "
+                  f"{holder['group']} (net gain {gain:.3f} J) — rerun with --commit")
+            return
+        already = conn.execute(
+            "SELECT 1 FROM mints WHERE family_id=? AND prev_group=? AND new_group=?",
+            (fam, holder["group"], candidate["group"]),
+        ).fetchone()
+        if gain > 0 and already is None:
+            conn.execute(
+                "INSERT INTO mints(family_id, prev_group, new_group, prev_low_j, "
+                "new_high_j, verify_energy_j, certified_gain_j, note, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (fam, holder["group"], candidate["group"], holder["low"],
+                 candidate["high"], candidate["verify_mean"], gain,
+                 "SIMULATED", now_iso()),
+            )
+        _set_state(conn, fam, candidate)
         conn.commit()
         print()
         print("  " + "=" * 52)
         print(f"  NEW FRONTIER   family={fam}")
-        print(f"  Previous: {holder['mean']:8.3f} J ±{K_SIGMA*holder['sigma']/holder['n']**0.5:.3f}"
-              f"  ({holder['group']}, n={holder['n']})")
-        print(f"  New:      {candidate['mean']:8.3f} J ±{K_SIGMA*candidate['sigma']/candidate['n']**0.5:.3f}"
-              f"  ({candidate['group']}, n={candidate['n']})")
+        print(f"  Previous: {holder['mean']:8.3f} J  [{holder['low']:.3f}, "
+              f"{holder['high']:.3f}]  ({holder['group']}, n={holder['n']})")
+        print(f"  New:      {candidate['mean']:8.3f} J  [{candidate['low']:.3f}, "
+              f"{candidate['high']:.3f}]  ({candidate['group']}, n={candidate['n']})")
         print(f"  ΔE(mean): {holder['mean']-candidate['mean']:.3f} J")
-        print(f"  Certified net gain (III): {gain:.3f} J"
-              f"   [= prev_low − new_high − E_verify]")
-        print(f"  MINT (simulated): +{gain:.3f} CREDIT")
+        if gain > 0 and already is None:
+            print(f"  Certified net gain (III): {gain:.3f} J"
+                  f"   [= prev_low − new_high − E_verify]")
+            print(f"  MINT (simulated): +{gain:.3f} CREDIT"
+                  f"  (1 CREDIT ≡ 1 certified J — v0 provisional)")
+        elif already is not None:
+            print("  transition already minted once — no re-mint (grinding guard)")
+        else:
+            print("  frontier updated, NO MINT: net gain 0 after verification "
+                  "cost (Constitution III)")
         print("  " + "=" * 52)
     else:
         print(f"\n  challenger {candidate['group']} not certified: interval "
               f"[{candidate['low']:.3f}, {candidate['high']:.3f}] overlaps holder "
-              f"low {holder['low']:.3f} (add replications to narrow σ/√n)")
+              f"low {holder['low']:.3f}")
 
 
 # ------------------------------------------------------------------ calibrate
 
 def cmd_calibrate(task_prefix: str, runner: str):
+    """Audit fix: sigma is reported per (runner, meter) stratum — receipts on
+    different meter boundaries are different scales and share no sigma."""
     conn = db()
     task = resolve_task(conn, task_prefix)
     rows = conn.execute(
@@ -867,22 +938,29 @@ def cmd_calibrate(task_prefix: str, runner: str):
            WHERE rc.family_id=? AND r.runner_id=?""",
         (task["family_id"], runner),
     ).fetchall()
-    energies = [json.loads(r["receipt_json"])["run_energy"]["energy_joules"]
-                for r in rows]
-    if len(energies) < 2:
-        print(f"calibrate: need >=2 receipts for {runner} (have {len(energies)})")
+    strata = {}
+    for r in rows:
+        rec = json.loads(r["receipt_json"])
+        strata.setdefault(rec["meter_id"], []).append(
+            rec["run_energy"]["energy_joules"])
+    if not strata:
+        print(f"calibrate: no receipts for {runner}")
         return
-    n = len(energies)
-    mean = sum(energies) / n
-    var = sum((x - mean) ** 2 for x in energies) / (n - 1)
-    sigma = var ** 0.5
     print(f"calibration  runner={runner}  family={task['family_id']}")
-    print("  " + " / ".join(f"{e:.3f}" for e in energies) + "  J")
-    print(f"  n={n}  mean={mean:.3f} J  σ={sigma:.3f} J  cv={sigma/mean*100:.1f}%")
-    print(f"  minimum certifiable improvement (single run, {K_SIGMA:g}σ): "
-          f"{K_SIGMA*sigma:.3f} J")
-    print(f"  minimum certifiable improvement (n={n} replications, "
-          f"{K_SIGMA:g}σ/√n): {K_SIGMA*sigma/n**0.5:.3f} J")
+    for meter, energies in sorted(strata.items()):
+        n = len(energies)
+        if n < 2:
+            print(f"  [{meter}] n={n} — need >=2 receipts for σ")
+            continue
+        mean = sum(energies) / n
+        var = sum((x - mean) ** 2 for x in energies) / (n - 1)
+        sigma = var ** 0.5
+        print(f"  [{meter}]")
+        print("    " + " / ".join(f"{e:.3f}" for e in energies) + "  J")
+        print(f"    n={n}  mean={mean:.3f} J  σ={sigma:.3f} J  cv={sigma/mean*100:.1f}%")
+        print(f"    min certifiable improvement within this meter "
+              f"({K_SIGMA:g}σ/√n, measured-σ groups only): "
+              f"{K_SIGMA*sigma/n**0.5:.3f} J")
 
 
 # ----------------------------------------------------------------------- demo
@@ -892,7 +970,7 @@ def summary_jps(task_prefix: str):
     conn = db()
     task = resolve_task(conn, task_prefix)
     rows = conn.execute(
-        """SELECT r.runner_id,
+        """SELECT r.runner_id, m.method,
                   COUNT(*) AS runs,
                   SUM(CASE WHEN v.status='PASS' THEN 1 ELSE 0 END) AS passes,
                   SUM(m.energy_joules) AS total_j
@@ -900,14 +978,14 @@ def summary_jps(task_prefix: str):
            JOIN measurements m ON m.run_id = r.run_id
            LEFT JOIN verifications v ON v.run_id = r.run_id
            WHERE r.task_instance_id=?
-           GROUP BY r.runner_id ORDER BY total_j""",
+           GROUP BY r.runner_id, m.method ORDER BY total_j""",
         (task["task_instance_id"],),
     ).fetchall()
     for r in rows:
         passes = r["passes"] or 0
         jps = f"{r['total_j']/passes:8.3f}" if passes else "     inf"
-        print(f"  {r['runner_id']:<14} runs={r['runs']:<3} pass={passes:<3} "
-              f"total={r['total_j']:8.3f} J  J/success={jps}")
+        print(f"  {r['runner_id']:<14} [{r['method']:<10}] runs={r['runs']:<3} "
+              f"pass={passes:<3} total={r['total_j']:8.3f} J  J/success={jps}")
 
 
 def demo_codefix():
@@ -922,19 +1000,23 @@ def demo_codefix():
     cmd_calibrate(task_id, "codefix_brute")
 
     print("\n[3/5] first record")
-    cmd_frontier(task_id)
+    cmd_frontier(task_id, commit=True)
 
     print("\n[4/5] rule-based fix × 5 (knows the bug class)")
     cmd_run(task_id, "codefix_rules", repeat=5)
-    cmd_frontier(task_id)
+    cmd_frontier(task_id, commit=True)
 
     if shutil.which("ollama"):
         model = os.environ.get("EDEN_LLM_MODEL", "qwen2.5:7b")
-        print(f"\n[5/5] local LLM runner × 2 (ollama {model}; warm-up run excluded)")
-        subprocess.run(["ollama", "run", model, "Reply with exactly: OK"],
-                       capture_output=True, text=True, timeout=600)
-        cmd_run(task_id, "codefix_llm", repeat=2)
-        cmd_frontier(task_id)
+        print(f"\n[5/5] local LLM runner × 2 (ollama {model}, ~5 GB model is "
+              "pulled on first use; warm-up run excluded from measurement)")
+        try:
+            subprocess.run(["ollama", "run", model, "Reply with exactly: OK"],
+                           capture_output=True, text=True, timeout=600)
+            cmd_run(task_id, "codefix_llm", repeat=2)
+            cmd_frontier(task_id, commit=True)
+        except subprocess.TimeoutExpired:
+            print("  ollama warm-up timed out — skipping LLM runner")
     else:
         print("\n[5/5] ollama not found — skipping LLM runner")
 
@@ -955,15 +1037,15 @@ def cmd_demo():
     cmd_calibrate(task_id, "naive_count")
 
     print("\n[4/6] first record")
-    cmd_frontier(task_id)
+    cmd_frontier(task_id, commit=True)
 
     print("\n[5/6] challenger: dict_loop × 5")
     cmd_run(task_id, "dict_loop", repeat=5)
-    cmd_frontier(task_id)
+    cmd_frontier(task_id, commit=True)
 
     print("\n[6/6] challenger: counter_fast × 5")
     cmd_run(task_id, "counter_fast", repeat=5)
-    cmd_frontier(task_id)
+    cmd_frontier(task_id, commit=True)
 
     print("\n[extra] failing runner: bad_topk × 1 (Constitution II check)")
     cmd_run(task_id, "bad_topk", repeat=1)
@@ -1010,8 +1092,10 @@ def main():
     pc.add_argument("--task", required=True)
     pc.add_argument("--runner", required=True)
 
-    pf = sub.add_parser("frontier", help="compute frontier, detect dominance")
+    pf = sub.add_parser("frontier", help="analyze frontier (read-only; --commit mints)")
     pf.add_argument("--task", required=True)
+    pf.add_argument("--commit", action="store_true",
+                    help="update frontier state and mint (default: analysis only)")
 
     pd = sub.add_parser("demo", help="full demo scenario on this machine")
     pd.add_argument("--scenario", choices=["topk", "codefix"], default="topk")
@@ -1041,7 +1125,7 @@ def main():
     elif a.cmd == "calibrate":
         cmd_calibrate(a.task, a.runner)
     elif a.cmd == "frontier":
-        cmd_frontier(a.task)
+        cmd_frontier(a.task, commit=a.commit)
     elif a.cmd == "demo":
         demo_codefix() if a.scenario == "codefix" else cmd_demo()
     elif a.cmd == "_refverify":
