@@ -152,3 +152,124 @@ VERIFIED  ATTESTED + 別ノードによる独立再検証（出力とテスト�
 
 **結論: この設計はまだ実装可能な状態にない。** 少なくとも失効の扱いを決めるまで、
 Phase Aに着手しない。
+
+---
+
+## 9. 失効(revocation)の設計 — 決定（2026-08-19）
+
+§8の設計致命への解答。**時刻を信用せず、chain上の順序だけを信用する。**
+
+### 9.1 中心となる観察
+
+署名時刻の自己申告は信用できない（§8で指摘した通り）。しかしEDENは既に、
+時刻に依存しない順序を持っている:
+
+```text
+chain journal  = 追記専用、各entryが前entryにコミット
+chain head     = git commit本文へ焼き込み済み（外部アンカー）
+```
+
+**あるレシートがchainのどのseqにいるかは、gitの公開履歴が固定している。**
+だから失効の判定に日時は要らない:
+
+```text
+署名が有効 ⟺ receipt の chain seq  <  失効イベントの chain seq
+```
+
+これは憲法I（Observation Before Prediction）の精神そのもの —
+自己申告のtimestampではなく、台帳に観測された順序だけを根拠にする。
+
+### 9.2 失効イベントの形
+
+失効もまた事実であり、追記される（憲法IV: 既存事実は書き換えない）:
+
+```text
+revocation = {
+  node_id, revoked_pubkey_fingerprint,
+  reason: "compromise" | "rotation" | "retirement",
+  successor_node_id  (rotationの場合のみ),
+  declared_by: 失効を宣言する鍵（自己失効 or 継承鍵）,
+  署名 (namespace: eden-revocation)
+}
+```
+
+- 失効イベントはchainに入る（＝seqを持つ）。だから失効自体も順序が固定される
+- **降格は起きない**: trust_stateは昇格のみのまま。失効は
+  「そのseq以降の署名を評価しない」という*解釈規則*であり、
+  過去のSIGNEDレシートの本文もstateも書き換えない
+- 失効後に現れた同一鍵の署名は `SIGNED` に到達しない（UNSIGNED相当として扱う）
+
+### 9.3 anchor頻度が失効の解像度を決める（正直な限界）
+
+git anchorが最後に打たれたseqを `A`、現在のheadを `H` とすると:
+
+- `seq ≤ A` の区間: 外部で固定済み。攻撃者は鍵を盗んでも過去へ遡って
+  レシートを差し込めない（chain hashが壊れ、gitの記録と矛盾する）
+- `A < seq ≤ H` の区間: **まだ外部で固定されていない**。
+  鍵とローカル台帳の両方を握った攻撃者は、この区間を作り直せる
+
+つまり **失効の実効的な保護は、直近のanchorまでしか遡らない**。
+これは分散consensusの代わりに公開gitを使うことの正確な代償であり、隠さない。
+
+対策（実装時の規則）:
+1. `eden chain checkpoint` を打つたびにanchor推奨をCLIが表示する
+2. 失効イベントを追記したら、**直ちに** checkpoint + git anchorを打つ
+   （攻撃者が未anchor区間を操作する窓を最小化する）
+3. anchor間隔はレシート数ではなく「未anchorの区間長」として台帳に表示する
+
+### 9.4 鍵ローテーション（§8の重大項目への解答）
+
+- `reason: "rotation"` の失効イベントに `successor_node_id` を含め、
+  **旧鍵で新鍵を署名**した継承レコードを添える
+- ノードの同一性は「鍵」ではなく「**継承チェーンの根**」で定義する:
+  `node_lineage_id = 最初の公開鍵のhash`。以後の鍵はこの系譜に属する
+- 漏洩(compromise)の場合は継承を許さない: 盗まれた鍵で後継を指名できてしまうため。
+  compromise失効後の新鍵は**新しい系譜**として出直す（履歴の連続性を失う代償を払う）
+
+### 9.5 この設計に残る穴（自己申告）
+
+1. **operatorが失効イベントをchainに入れない**: 失効の隠蔽は防げない。
+   第三者がanchorを監視して不一致を叫ぶしかない（分散化の前借りはできない）
+2. **未anchor区間の書き換え**（§9.3）: anchor頻度で緩和するのみ
+3. **自己失効の可用性**: 鍵を失った（漏洩でなく紛失した）ノードは自己失効を署名できない。
+   → 事前に「失効宣言を先に署名して保管しておく」(pre-signed revocation) を推奨事項とする
+4. **系譜の分岐**: 同一系譜から2つの後継が出た場合の解決規則が未定義（Phase 2）
+
+### 9.6 結論 — Phase Aのブロック解除条件
+
+§8の設計致命は解けた（時刻ではなく順序で解く）。残る§8項目のうち:
+- 鍵ローテーション → §9.4で解決
+- 後署名による選別 → **署名では解決しないと確定**。challenge coverageで縛る
+- 複数署名の閾値 → v0.5では「role毎に1署名、SIGNEDはrunner署名のみで成立」と定義。
+  meter/verifier署名は ATTESTED/VERIFIED の条件であり、SIGNEDの条件ではない
+
+**Phase A着手可。** ただし実装は §9.3 の anchor 規則を含むこと。
+
+### 9.7 設計を書いた直後の自己攻撃（同日、実装前に発見）
+
+**発見1【設計致命】: chainは失効イベントを入れられない。**
+現行スキーマは `chain(receipt_id UNIQUE, receipt_hash, prev_chain, chain_hash, ...)` で
+**レシート専用**。§9.2は「失効イベントはchainに入る」と書いたが、そのままでは入らない。
+修正: chainを汎用journalへ一般化する。
+
+```text
+chain(seq, entry_type, entry_id UNIQUE, entry_hash, prev_chain, chain_hash, chained_at)
+  entry_type ∈ {receipt, revocation, checkpoint, epoch_commitment}
+```
+
+既存147行は `entry_type='receipt'`, `entry_id=receipt_id`, `entry_hash=receipt_hash` へ
+**列名の移行のみ**で写る（chain_hashの再計算は不要 — 連鎖の材料はentry_hashのみ）。
+これは実装前に見つかったので移行コストがほぼゼロで済む。実装後なら147行の再連鎖が必要だった。
+
+**発見2【重大】: 未anchor区間は「0」ではなく運用で常に伸びる。**
+実測（2026-08-19、この台帳）: chain 147 / anchor済み 147 / 未保護 0枚。
+ただしこれは直前のcommitでheadを焼いたため。**challenge epoch 1回で18レシート**積まれるので、
+実験を回した直後は常に未保護区間ができる。§9.3の「anchor頻度が失効の解像度」は
+理論上の注意ではなく日常的な状態。
+→ 実装必須: `eden chain status` が未anchor区間長を常時表示し、
+   閾値超過で anchor を促す（数値ではなく「保護されていない枚数」で言う）。
+
+**発見3【軽微】: pre-signed revocation の保管場所問題。**
+§9.5-3で推奨した事前署名済み失効宣言は、鍵と同じ場所に置けば同時に盗まれ、
+別の場所に置けば紛失リスクが増える。v0.5では推奨に留め、保管方式は規定しない
+（規定できないことを規定しない）。
