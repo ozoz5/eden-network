@@ -107,6 +107,37 @@ What we can honestly claim from this ledger:
   smaller than verification energy (Constitution III), and a cheap-but-wrong
   runner got **no receipt** (Constitution II). Both under Level S.
 
+## First challenge-sampled results (v0.2)
+
+Frontiers must be "expected J over a distribution the protocol issues", not
+"minimum J over instances you chose". `eden challenge open` pins enrolled
+runner code hashes **before** generating instances (seeded bug injection into
+a correct module; the epoch seed is recomputable from the ledger). First
+epoch — 6 protocol-issued single-token bugs × 3 strategies:
+
+```text
+codefix_brute  6/6 (100%)   8.4 J total   →  1.41 J/success   [estimated]
+codefix_rules  0/6 (  0%)   0.9 J total   →  ∞                [estimated]
+codefix_llm    1/6 ( 17%)  893.9 J total  →  894 J/success    [Level V]
+```
+
+Three things this measured:
+
+- **Cherry-picking was real.** On the hand-picked bug earlier in this README
+  the LLM fixed 8/8; on the issued distribution it fixed 1/6. Self-chosen
+  results do not predict distribution results — visible only after challenge
+  sampling existed.
+- **Failures are billed** (the §8 metric works): five failed LLM attempts
+  burned 130–165 J each, so the true cost per verified success is ~894 J.
+- **Specialist knowledge dies off-distribution**: the rule-based runner went
+  0/6 (giving up honestly at 0.15 J per attempt).
+
+Declared bias: the injected-bug vocabulary is a subset of the brute-force
+searcher's mutation vocabulary, so this distribution structurally favors
+search. The honest claim is "search dominates single-token bug
+distributions", not "search beats LLMs". Harness validated: one failed
+instance passed on manual replay (stochastic), two failed again (real).
+
 ## Measurement honesty
 
 Every condition that decides whether a receipt group may hold a record or

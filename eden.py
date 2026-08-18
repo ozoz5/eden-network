@@ -35,6 +35,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
+import challenge as challenge_mod
 import eligibility
 
 BASE = Path(__file__).resolve().parent
@@ -427,6 +428,35 @@ CREATE TABLE IF NOT EXISTS mints(
   certified_gain_j REAL NOT NULL,
   note TEXT NOT NULL,
   created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS epochs(
+  epoch_id TEXT PRIMARY KEY,
+  family_id TEXT NOT NULL,
+  epoch_no INTEGER NOT NULL,
+  seed TEXT NOT NULL,
+  n_instances INTEGER NOT NULL,
+  gen_spec_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS enrollments(
+  epoch_id TEXT NOT NULL,
+  runner_id TEXT NOT NULL,
+  runner_code_hash TEXT NOT NULL,
+  committed_at TEXT NOT NULL,
+  PRIMARY KEY(epoch_id, runner_id)
+);
+CREATE TABLE IF NOT EXISTS epoch_instances(
+  epoch_id TEXT NOT NULL,
+  instance_index INTEGER NOT NULL,
+  task_instance_id TEXT NOT NULL,
+  bug_desc TEXT NOT NULL,
+  PRIMARY KEY(epoch_id, instance_index)
+);
+CREATE TABLE IF NOT EXISTS epoch_runs(
+  epoch_id TEXT NOT NULL,
+  run_id TEXT PRIMARY KEY,
+  instance_index INTEGER NOT NULL,
+  runner_id TEXT NOT NULL
 );
 """
 
@@ -1040,6 +1070,149 @@ def cmd_demo():
     print(f"\nledger: {n_receipts} receipts, {n_mints} simulated mints, db={DB_PATH.name}")
 
 
+# ---------------------------------------------------------------- challenges
+
+def cmd_challenge_open(gen_spec_path: str, runners: list, n: int):
+    """Open an epoch: pin runner code hashes FIRST, then derive the seed and
+    generate instances. Enrollment strictly precedes revelation (§6.17)."""
+    conn = db()
+    spec = json.loads(Path(gen_spec_path).read_text())
+    fam = family_id_of(spec)
+
+    enrollment = []
+    for runner in runners:
+        rp = RUNNERS_DIR / f"{runner}.py"
+        if not rp.exists():
+            sys.exit(f"error: runner '{runner}' not found")
+        enrollment.append((runner, sha(rp.read_bytes())[:16]))
+
+    epoch_no = 1 + conn.execute(
+        "SELECT COUNT(*) c FROM epochs WHERE family_id=?", (fam,)
+    ).fetchone()["c"]
+    recent = [r["receipt_hash"] for r in conn.execute(
+        "SELECT receipt_hash FROM receipts ORDER BY created_at DESC LIMIT 100")]
+    seed = challenge_mod.derive_epoch_seed(fam, epoch_no, recent)
+    epoch_id = sha(fam + str(epoch_no) + seed)[:16]
+
+    conn.execute("INSERT INTO epochs VALUES (?,?,?,?,?,?,?)",
+                 (epoch_id, fam, epoch_no, seed, n, canonical(spec), now_iso()))
+    for runner, code_hash in enrollment:
+        conn.execute("INSERT INTO enrollments VALUES (?,?,?,?)",
+                     (epoch_id, runner, code_hash, now_iso()))
+    conn.commit()  # commitments are durable before any instance exists
+
+    correct = (BASE / spec["correct_source"]).read_text()
+    test_path = BASE / spec["test_file"]
+    inst_dir = DATA_DIR / "epochs" / epoch_id
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    print(f"epoch {epoch_id}  family={fam}  no={epoch_no}  seed={seed[:16]}…")
+    print(f"enrolled: " + ", ".join(f"{r}#{h[:6]}" for r, h in enrollment))
+    used = set()
+    for i in range(n):
+        # Deterministic de-duplication: if a seed collapses onto an already
+        # issued bug, derive follow-up seeds by a fixed, auditable rule.
+        for attempt in range(16):
+            inst_seed = sha(seed + str(i) + ":" + str(attempt))
+            mutant, bug = challenge_mod.inject_bug(
+                correct, inst_seed, test_path, spec["module_name"])
+            if bug not in used:
+                break
+        used.add(bug)
+        inst_path = inst_dir / f"inst_{i}.py"
+        inst_path.write_text(mutant)
+        inst_spec = dict(spec)
+        inst_spec["source_file"] = str(inst_path.relative_to(BASE))
+        input_hash = sha(mutant)[:16]
+        task_id = sha(fam + input_hash)[:16]
+        conn.execute(
+            "INSERT OR IGNORE INTO tasks VALUES (?,?,?,?,?,?,?,?)",
+            (task_id, fam, spec["task_contract_version"], canonical(inst_spec),
+             str(inst_path), input_hash, verifier_spec_hash(spec), now_iso()),
+        )
+        conn.execute("INSERT INTO epoch_instances VALUES (?,?,?,?)",
+                     (epoch_id, i, task_id, bug))
+        print(f"  instance {i}: task={task_id}  bug={bug}")
+    conn.commit()
+    return epoch_id
+
+
+def cmd_challenge_run(epoch_prefix: str):
+    conn = db()
+    epoch = conn.execute("SELECT * FROM epochs WHERE epoch_id LIKE ?",
+                         (epoch_prefix + "%",)).fetchone()
+    if epoch is None:
+        sys.exit(f"error: no epoch matching '{epoch_prefix}'")
+    instances = conn.execute(
+        "SELECT * FROM epoch_instances WHERE epoch_id=? ORDER BY instance_index",
+        (epoch["epoch_id"],)).fetchall()
+    enrolled = conn.execute(
+        "SELECT * FROM enrollments WHERE epoch_id=?", (epoch["epoch_id"],)
+    ).fetchall()
+    for e in enrolled:
+        rp = RUNNERS_DIR / f"{e['runner_id']}.py"
+        current = sha(rp.read_bytes())[:16] if rp.exists() else ""
+        if not challenge_mod.check_enrollment(e["runner_code_hash"], current):
+            print(f"  SKIP {e['runner_id']}: code hash changed since "
+                  f"enrollment ({e['runner_code_hash'][:6]} -> {current[:6]})")
+            continue
+        for inst in instances:
+            print(f"-- instance {inst['instance_index']} × {e['runner_id']}")
+            run_ids = cmd_run(inst["task_instance_id"], e["runner_id"], repeat=1)
+            for rid in run_ids:
+                conn.execute("INSERT OR IGNORE INTO epoch_runs VALUES (?,?,?,?)",
+                             (epoch["epoch_id"], rid,
+                              inst["instance_index"], e["runner_id"]))
+            # commit per instance: cmd_run opens its own connection, so an
+            # open transaction here would deadlock the ledger
+            conn.commit()
+
+
+def cmd_challenge_report(epoch_prefix: str):
+    conn = db()
+    epoch = conn.execute("SELECT * FROM epochs WHERE epoch_id LIKE ?",
+                         (epoch_prefix + "%",)).fetchone()
+    if epoch is None:
+        sys.exit(f"error: no epoch matching '{epoch_prefix}'")
+    eid = epoch["epoch_id"]
+    print(f"epoch {eid}  family={epoch['family_id']}  "
+          f"instances={epoch['n_instances']}  seed={epoch['seed'][:16]}…")
+    print("\nper-instance results (PASS/fail/err):")
+    grid = conn.execute(
+        """SELECT er.instance_index, er.runner_id, ei.bug_desc,
+                  COALESCE(v.status, r.status) AS outcome
+           FROM epoch_runs er
+           JOIN runs r ON r.run_id = er.run_id
+           JOIN epoch_instances ei ON ei.epoch_id = er.epoch_id
+                AND ei.instance_index = er.instance_index
+           LEFT JOIN verifications v ON v.run_id = er.run_id
+           WHERE er.epoch_id=? ORDER BY er.instance_index, er.runner_id""",
+        (eid,)).fetchall()
+    for row in grid:
+        print(f"  #{row['instance_index']} [{row['bug_desc']:<12}] "
+              f"{row['runner_id']:<16} {row['outcome']}")
+    print("\nexpected J over the issued distribution "
+          "(§8/§9 primary metric, ALL runs incl. failures):")
+    stats = conn.execute(
+        """SELECT er.runner_id, m.method,
+                  COUNT(*) AS runs,
+                  SUM(CASE WHEN v.status='PASS' THEN 1 ELSE 0 END) AS passes,
+                  SUM(m.energy_joules) AS total_j
+           FROM epoch_runs er
+           JOIN runs r ON r.run_id = er.run_id
+           JOIN measurements m ON m.run_id = er.run_id
+           LEFT JOIN verifications v ON v.run_id = er.run_id
+           WHERE er.epoch_id=?
+           GROUP BY er.runner_id, m.method ORDER BY total_j""",
+        (eid,)).fetchall()
+    for r in stats:
+        passes = r["passes"] or 0
+        rate = passes / r["runs"] * 100
+        jps = f"{r['total_j']/passes:9.3f}" if passes else "      inf"
+        print(f"  {r['runner_id']:<16} [{r['method']:<10}] "
+              f"success {passes}/{r['runs']} ({rate:3.0f}%)  "
+              f"total={r['total_j']:9.3f} J  J/success={jps}")
+
+
 # ------------------------------------------------------------------------ cli
 
 def main():
@@ -1082,6 +1255,18 @@ def main():
     pd = sub.add_parser("demo", help="full demo scenario on this machine")
     pd.add_argument("--scenario", choices=["topk", "codefix"], default="topk")
 
+    pch = sub.add_parser("challenge", help="protocol-issued task epochs (§6.17)")
+    csub = pch.add_subparsers(dest="ch_cmd", required=True)
+    co = csub.add_parser("open", help="enroll runners, then generate instances")
+    co.add_argument("--spec", default=str(BASE / "tasks" / "codefix_gen.json"))
+    co.add_argument("--runners", required=True,
+                    help="comma-separated runner names to enroll")
+    co.add_argument("-n", type=int, default=6)
+    cr = csub.add_parser("run", help="run all enrolled runners on all instances")
+    cr.add_argument("epoch")
+    cp = csub.add_parser("report", help="expected-J report over the epoch")
+    cp.add_argument("epoch")
+
     prv = sub.add_parser("_refverify", help=argparse.SUPPRESS)
     prv.add_argument("input_path")
     prv.add_argument("k", type=int)
@@ -1110,6 +1295,12 @@ def main():
         cmd_frontier(a.task, commit=a.commit)
     elif a.cmd == "demo":
         demo_codefix() if a.scenario == "codefix" else cmd_demo()
+    elif a.cmd == "challenge" and a.ch_cmd == "open":
+        cmd_challenge_open(a.spec, a.runners.split(","), a.n)
+    elif a.cmd == "challenge" and a.ch_cmd == "run":
+        cmd_challenge_run(a.epoch)
+    elif a.cmd == "challenge" and a.ch_cmd == "report":
+        cmd_challenge_report(a.epoch)
     elif a.cmd == "_refverify":
         words = Path(a.input_path).read_text().split()
         print(canonical(reference_topk(words, a.k)))
