@@ -154,6 +154,36 @@ five failures:
 ★ llm    rate  17% [ 3, 56]   894 J/success    ← frontier (Level V meter, genesis)
 ```
 
+## The §9 experiment: intelligent frugality exists (v0.3, epoch cc846674)
+
+Seven strategies, one protocol-issued distribution (12 instances, 8 distinct
+single-token bugs), all failures billed, verification energy inside the cost,
+every LLM measured on the package meter (Level V):
+
+```text
+strategy                     success   J/success (verify incl.)
+cascade (rule→search→1.5b→7b) 12/12      1.37   ← sole Level V frontier holder
+brute search                  12/12      1.53   (estimated meter)
+phi4 14b                      11/12    287
+qwen2.5:1.5b                   6/12     81
+qwen2.5:7b                     5/12    391
+qwen2.5:7b × 3 retries         5/12    404
+targeted rule                  0/12      ∞
+```
+
+What this measured: **escalating-cheapest-first wins outright** on this
+distribution (100% success at 1/210th of phi4's cost per success — the
+original spec's "intelligent frugality" hypothesis, answered); **the small
+model is 3.5–4.8× cheaper per verified success** than its bigger siblings
+and Pareto-dominates the 7b outright; and **retries buy nothing against
+systematic failures** — the 7b fails the same way every time, so three
+attempts cost 3× for the same 5/12.
+
+Declared bias, as always: the bug vocabulary is a subset of the searcher's
+mutation vocabulary, so the cascade resolved everything in its cheap stages
+(its LLM stages never fired). On a distribution that defeats search, these
+numbers will look different — that experiment is next.
+
 ## First independent replication (two nodes)
 
 On 2026-08-18 a second machine (M1 MacBook Air, Python 3.9) ran the same
