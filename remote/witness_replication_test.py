@@ -1,7 +1,8 @@
 """EDEN independent replication on WITNESS (shadow_verify_v1 payload).
 
 Runs the topk family (3 runners x 5 repeats, estimated meter) on this
-machine and emits every receipt into the bounded unittest log between
+machine (corpus 15k tokens, 3 repeats: the WITNESS sandbox caps every
+file write at 128KB (RLIMIT_FSIZE), including the SQLite ledger) and emits every receipt into the bounded unittest log between
 markers, so the origin node can import them. The task spec is embedded
 because the shadow bundle only ships allow-listed source suffixes.
 """
@@ -20,7 +21,7 @@ SPEC = {
         "type": "synthetic-words",
         "seed": 42,
         "vocab": 800,
-        "tokens": 200000,
+        "tokens": 12000,
         "zipf": 1.1,
     },
     "k": 10,
@@ -33,7 +34,7 @@ SPEC = {
 }
 
 RUNNERS = ["naive_count", "dict_loop", "counter_fast"]
-REPEAT = 5
+REPEAT = 2
 
 
 class TestWitnessReplication(unittest.TestCase):

@@ -483,6 +483,10 @@ CREATE TABLE IF NOT EXISTS distribution_certs(
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    # Small pages keep a fresh ledger compact (matters inside sandboxes that
+    # cap file sizes, e.g. the 128KB RLIMIT_FSIZE of TwinLoop shadow jobs).
+    # Only takes effect when the database is newly created.
+    conn.execute("PRAGMA page_size=1024")
     conn.executescript(SCHEMA)
     return conn
 

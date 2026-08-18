@@ -431,6 +431,30 @@ challenge epochの集約結果を前線の正式な入力単位にした（GPT�
 残る構造課題: 1D前線（非challenge family）とdist前線の併存はv0.4で統合判断。
 区間考慮のPareto支配（ci95重複時の保留）は未実装（pendingに追加すべき）。
 
+### v0実装記録 追補8（2026-08-18 — WITNESS独立再現: EDENが2ノードになった日）
+
+TwinLoop Relay `shadow_verify_v1`（署名付きジョブ・任意コマンド不可）経由で、サブ機WITNESS（M1 Air / 8GB /
+macOS 26.5.2 / Python 3.9）にEDEN計測パイプラインをテストペイロードとして送り、レシート6枚を
+ログ経由で回収してFORGE台帳へ取り込んだ（`eden import`、無署名クレームと明示）。
+
+**確定した事実:**
+- **family_idが両ノードで独立導出され完全一致**（`2a8243b5b0f9f404`。Python 3.14 vs 3.9、別マシン）—
+  §4の機械導出が初めてクロスノードで実証された
+- **runner_code_hashも両ノードで一致** — 同一実装の証明がハッシュで通った
+- **ハードウェア指紋層別が機能** — 同一runner・同一メーターでもhwf991f2（FORGE/M5 Pro）と
+  hw10f070（WITNESS/M1）は別群となり、σを共有しない
+- **初のハードウェア波動データ（§6.3）**: 同一コードのcpu時間比 M1/M5 Pro ≈ 1.4×
+  （naive 0.595 vs 0.408 J、counter 0.128 vs 0.094 J — estimated同一6.0W仮定下、実質cpu秒比較）
+- 輸送はSHA-256付きtransport receiptで検証可能（job d1054dbd、verdict: pass）
+
+**過程で発見・修正**: WITNESSのsandboxは全書き込みに128KB上限（RLIMIT_FSIZE）。コーパス→12kトークン、
+SQLiteページ→1024バイト（新規DBのみ、eden.py恒久修正）で通過。3回の実測往復（1.2MB失敗→352KB失敗→
+72KB+44KB成功）で限界値を確定。
+
+**正直な限界**: WITNESSレシートは無署名（データ完全性は未決のまま）。6.0W/cpu秒の仮定は両機共通に
+適用しており、実際の電力差は測っていない（M1のLevel V化はWITNESS側のsudo許可が必要）。
+再現はn=2/群であり、記録保持資格（n≥3）には満たない — これは意図的で、次のepochで積む。
+
 ---
 
 ## 8. 検証済みの外部事実（2026-08-16時点の調査）

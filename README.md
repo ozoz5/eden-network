@@ -154,6 +154,24 @@ five failures:
 ★ llm    rate  17% [ 3, 56]   894 J/success    ← frontier (Level V meter, genesis)
 ```
 
+## First independent replication (two nodes)
+
+On 2026-08-18 a second machine (M1 MacBook Air, Python 3.9) ran the same
+pipeline inside a signed, sandboxed relay job and its receipts were imported
+into this ledger as explicitly unsigned claims. The family id derived
+independently on both machines and matched exactly; so did every runner code
+hash. Hardware-fingerprint stratification kept the two machines in separate
+replication groups:
+
+```text
+counter_fast @M5 Pro  n=2  0.094 J        counter_fast @M1  n=2  0.128 J
+dict_loop    @M5 Pro  n=2  0.097 J        dict_loop    @M1  n=2  0.139 J
+naive_count  @M5 Pro  n=2  0.408 J        naive_count  @M1  n=2  0.595 J
+```
+
+Same code, ~1.4× the cpu-time on the older chip — the first measured data
+point for the hardware-wave open problem in the spec.
+
 ## Measurement honesty
 
 Every condition that decides whether a receipt group may hold a record or
