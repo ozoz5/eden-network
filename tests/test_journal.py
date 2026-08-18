@@ -54,6 +54,50 @@ class TestRuleDerivation(unittest.TestCase):
                          [])
 
 
+class TestRuleHistory(unittest.TestCase):
+    """The rule history must validate as a state machine, not a list of claims."""
+
+    VALID = [{"seq": 1, "from_seq": 2, "old_rule": "v1-legacy",
+              "new_rule": "v2-domain"}]
+
+    def _others(self, history):
+        """Problems other than the timing rule, so each check is proven alone."""
+        return [p for p in journal.validate_rule_history(history)
+                if "takes effect" not in p]
+
+    def test_valid_history_accepted(self):
+        self.assertEqual(journal.validate_rule_history(self.VALID), [])
+
+    def test_change_must_take_effect_right_after_itself(self):
+        for from_seq in (2, 50):          # reaching backward, and skipping ahead
+            history = [{"seq": 10, "from_seq": from_seq,
+                        "old_rule": "v1-legacy", "new_rule": "v2-domain"}]
+            self.assertTrue(any("takes effect" in p for p in
+                                journal.validate_rule_history(history)))
+
+    def test_old_rule_must_be_the_one_in_force(self):
+        history = self.VALID + [{"seq": 8, "from_seq": 9,
+                                 "old_rule": "v1-legacy",
+                                 "new_rule": "v2-domain"}]
+        self.assertTrue(any("in force" in p for p in self._others(history)))
+
+    def test_downgrade_refused_in_history(self):
+        history = self.VALID + [{"seq": 8, "from_seq": 9,
+                                 "old_rule": "v2-domain",
+                                 "new_rule": "v1-legacy"}]
+        self.assertTrue(any("downgrade" in p for p in self._others(history)))
+
+    def test_unknown_rule_refused_in_history(self):
+        history = self.VALID + [{"seq": 8, "from_seq": 9,
+                                 "old_rule": "v2-domain",
+                                 "new_rule": "v9-invented"}]
+        self.assertTrue(any("unknown rule" in p for p in self._others(history)))
+
+    def test_two_changes_cannot_start_at_the_same_seq(self):
+        history = self.VALID + self.VALID
+        self.assertTrue(any("already starts" in p for p in self._others(history)))
+
+
 class TestJournalMigration(unittest.TestCase):
     def setUp(self):
         self._dir = tempfile.TemporaryDirectory()
@@ -125,6 +169,17 @@ class TestJournalMigration(unittest.TestCase):
         self._run(eden.cmd_chain_build)
         self._run(eden.cmd_chain_migrate)
         self.conn.execute("UPDATE chain SET hash_rule='v2-domain' WHERE seq=1")
+        self.conn.commit()
+        self.assertFalse(self._run(eden.cmd_chain_verify))
+
+    def test_retroactive_rule_change_rejected_in_the_ledger(self):
+        self._run(eden.cmd_chain_build)
+        self._run(eden.cmd_chain_migrate)
+        body = eden.canonical({"from_seq": 2, "old_rule": "v1-legacy",
+                               "new_rule": "v2-domain",
+                               "reason": "retroactive"})
+        self._run(eden._chain_append, self.conn, "rule_change",
+                  "evil:" + eden.sha(body)[:16], body, "v2-domain")
         self.conn.commit()
         self.assertFalse(self._run(eden.cmd_chain_verify))
 

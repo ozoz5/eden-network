@@ -51,6 +51,41 @@ def rule_at(rule_changes, seq: int) -> str:
     return rule
 
 
+def validate_rule_history(changes) -> list:
+    """The rule history is itself a state machine, not a list of claims.
+
+    A change is only meaningful if it takes effect immediately after its own
+    entry, names the rule that was actually in force, and moves forward:
+    otherwise a later entry could reach back and redefine how earlier entries
+    are read.
+
+    changes: [{seq, from_seq, old_rule, new_rule}, ...]
+    """
+    problems = []
+    in_force = LEGACY_RULE
+    seen_from = set()
+    for ch in sorted(changes, key=lambda c: c.get("seq", 0)):
+        seq = ch.get("seq")
+        frm = ch.get("from_seq")
+        new = ch.get("new_rule")
+        if frm != (seq or 0) + 1:
+            problems.append(
+                f"seq {seq}: takes effect at {frm}, must be {(seq or 0) + 1} "
+                "(a change may not reach backward or skip ahead)")
+        if ch.get("old_rule") != in_force:
+            problems.append(
+                f"seq {seq}: claims to supersede {ch.get('old_rule')}, "
+                f"but {in_force} was in force")
+        if frm in seen_from:
+            problems.append(f"seq {seq}: another change already starts at {frm}")
+        seen_from.add(frm)
+        problems += [f"seq {seq}: {r}"
+                     for r in validate_rule_change(in_force, new)]
+        if new in SUPPORTED_RULES and RULE_STRENGTH[new] > RULE_STRENGTH[in_force]:
+            in_force = new
+    return problems
+
+
 def validate_rule_change(old_rule: str, new_rule: str) -> list:
     reasons = []
     if new_rule not in SUPPORTED_RULES:

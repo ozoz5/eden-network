@@ -366,6 +366,22 @@ body = {from_seq: 148, field: "entry_hash", old_rule: "v1-legacy",
 教訓: **正本の二重化は改竄検出を殺す。** journalに置いてよいのは、
 他に本文の置き場がないentry（rule_change等）だけ。
 
+### 10.7 規則履歴そのものの検証（第6次監査 — 実装済み）
+
+`rule_at()` が読む `rule_change` 群を、**主張の列ではなく状態機械として検証する**。
+`journal.validate_rule_history()`:
+
+| 検査 | 拒否する攻撃 |
+|---|---|
+| `from_seq == seq + 1` | 遡って過去の解釈を書き換える change、先の範囲を予約する change |
+| `old_rule == 宣言時点で有効な規則` | 履歴を無視した規則の詐称 |
+| `from_seq` の重複なし | 同じ地点から分岐する履歴 |
+| `validate_rule_change` | 未知規則、弱い規則への後退 |
+
+実測で各検査が単独に効くことを確認（テスト固定）。遡及changeを実台帳形式で挿入した
+攻撃も拒否される。**規則変更は事実として記録されるが、履歴の整合を欠く変更は
+解釈として採用されない。**
+
 ### 10.4 実装順序への影響（Phase A改訂）
 
 1. chain汎用journal化（列追加 + hash_rule='v1-legacy' を既存147件へ）

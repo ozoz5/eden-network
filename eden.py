@@ -1501,10 +1501,12 @@ def _rule_changes(conn):
     """Rule history, read from the journal itself."""
     changes = []
     for row in conn.execute(
-            "SELECT entry_body FROM chain WHERE entry_type='rule_change' "
+            "SELECT seq, entry_body FROM chain WHERE entry_type='rule_change' "
             "ORDER BY seq"):
         if row["entry_body"]:
-            changes.append(json.loads(row["entry_body"]))
+            change = json.loads(row["entry_body"])
+            change["seq"] = row["seq"]
+            changes.append(change)
     return changes
 
 
@@ -1627,6 +1629,9 @@ def cmd_chain_verify():
     boundary = _legacy_boundary(conn)
     head = sha(CHAIN_GENESIS)
     ok = True
+    for problem in journal_mod.validate_rule_history(changes):
+        print(f"  rule history: {problem}")
+        ok = False
     for row in conn.execute("SELECT * FROM chain ORDER BY seq"):
         seq = row["seq"]
         rule = journal_mod.rule_at(changes, seq)
