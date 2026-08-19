@@ -1003,6 +1003,8 @@ FRONTIER_ADMISSION = {
     "VERIFIED": True,
     # a signature that does not verify is a failed claim, not a measurement
     "INVALID": False,
+    # signed by a key the ledger later stopped trusting
+    "REVOKED": False,
     # imported and unsigned: kept as observation, never priced
     "UNSIGNED": False,
 }
@@ -1698,9 +1700,9 @@ def cmd_chain_build():
     conn.commit()
     total = conn.execute("SELECT COUNT(*) c FROM chain").fetchone()["c"]
     if head is None:
-        head = conn.execute(
-            "SELECT chain_hash FROM chain ORDER BY seq DESC LIMIT 1"
-        ).fetchone()["chain_hash"]
+        row = conn.execute(
+            "SELECT chain_hash FROM chain ORDER BY seq DESC LIMIT 1").fetchone()
+        head = row["chain_hash"] if row else sha(CHAIN_GENESIS)
     print(f"chained {len(rows)} new receipts (journal length {total})")
     print(f"chain head: {head}")
 
@@ -1714,41 +1716,45 @@ def cmd_chain_migrate():
     which the columns added by the migration cannot do on their own.
     """
     conn = db()
-    if any(c.get("new_rule") == journal_mod.DOMAIN_RULE
-           for c in _rule_changes(conn)):
-        print("journal already migrated to " + journal_mod.DOMAIN_RULE)
+    current = _next_rule(conn)
+    target = journal_mod.next_stronger_rule(current)
+    if target is None:
+        print(f"journal already at the strongest known rule ({current})")
         return
     boundary = conn.execute("SELECT COALESCE(MAX(seq),0) m FROM chain"
                             ).fetchone()["m"]
-    manifest = [{"seq": r["seq"], "entry_type": "receipt",
-                 "hash_rule": journal_mod.LEGACY_RULE,
+    changes = _rule_changes(conn)
+    manifest = [{"seq": r["seq"],
+                 "entry_type": (r["entry_type"] or
+                                journal_mod.legacy_type_of(r["seq"], boundary)),
+                 "hash_rule": journal_mod.rule_at(changes, r["seq"]),
                  "entry_hash": r["entry_hash"]}
                 for r in conn.execute(
-                    "SELECT seq, entry_hash FROM chain ORDER BY seq")]
-    reasons = journal_mod.validate_rule_change(journal_mod.LEGACY_RULE,
-                                               journal_mod.DOMAIN_RULE)
+                    "SELECT seq, entry_hash, entry_type FROM chain ORDER BY seq")]
+    reasons = journal_mod.validate_rule_change(current, target)
     if reasons:
         sys.exit("error: " + "; ".join(reasons))
     body = canonical({
         "from_seq": boundary + 2,          # the transition itself stays legacy
-        "old_rule": journal_mod.LEGACY_RULE,
-        "new_rule": journal_mod.DOMAIN_RULE,
+        "old_rule": current,
+        "new_rule": target,
         "legacy_boundary": boundary,
         "manifest_sha256": sha(canonical(manifest)),
         "manifest_entries": len(manifest),
-        "reason": "domain separation of entry hashes",
+        "reason": ("domain separation of entry hashes"
+                   if target == journal_mod.DOMAIN_RULE
+                   else "bind entry_id into the hash preimage"),
     })
     head = _chain_append(conn, "rule_change", "rule_change:" + sha(body)[:16],
-                         body, journal_mod.LEGACY_RULE)
+                         body, current)
     conn.execute("UPDATE chain SET entry_type='receipt', hash_rule=? "
                  "WHERE seq<=? AND entry_type IS NULL",
                  (journal_mod.LEGACY_RULE, boundary))
     conn.commit()
-    print(f"rule change recorded at seq {boundary + 1} under "
-          f"{journal_mod.LEGACY_RULE}")
-    print(f"  entries 1..{boundary}: {journal_mod.LEGACY_RULE} "
+    print(f"rule change recorded at seq {boundary + 1} under {current}")
+    print(f"  entries 1..{boundary}: written under earlier rules, unchanged "
           f"(manifest {sha(canonical(manifest))[:16]}…)")
-    print(f"  entries {boundary + 2}..: {journal_mod.DOMAIN_RULE}")
+    print(f"  entries {boundary + 2}..: {target}")
     print(f"chain head: {head}")
     print("anchor this head publicly before appending signed entries")
 
@@ -1924,9 +1930,14 @@ def trust_state_of(conn, receipt: dict, run_id: str) -> str:
                            (sig.get("node_id"),)).fetchone()
         if row is None:
             continue
-        if identity_mod.verify(canonical(body), sig.get("signature", ""),
-                               sig.get("namespace", ""), row["public_key"]):
-            return _verified_or_signed(conn, receipt)
+        if not identity_mod.verify(canonical(body), sig.get("signature", ""),
+                                   sig.get("namespace", ""), row["public_key"]):
+            continue
+        receipt_id = sha(canonical(receipt))[:16]
+        if not signature_still_valid(conn, sig.get("node_id"),
+                                     _entry_seq_of_receipt(conn, receipt_id)):
+            return "REVOKED"
+        return _verified_or_signed(conn, receipt)
     return "INVALID"
 
 
@@ -2018,7 +2029,8 @@ def cmd_verify_signatures():
         conn.execute("UPDATE receipts SET trust_state=? WHERE receipt_id=?",
                      (state, row["receipt_id"]))
     conn.commit()
-    for state in ("LOCAL", "UNSIGNED", "INVALID", "SIGNED", "VERIFIED"):
+    for state in ("LOCAL", "UNSIGNED", "INVALID", "REVOKED", "SIGNED",
+                  "VERIFIED"):
         if counts.get(state):
             print(f"  {state:<9}: {counts[state]}")
     print(f"invalid signatures: {bad}")
@@ -2045,6 +2057,75 @@ def cmd_chain_checkpoint():
     print(f"checkpoint signed by {nid[:12]}… at seq {row['seq']}")
     print(f"head: {row['chain_hash']}")
     print("anchor it now: put this head in the next commit message")
+
+
+def _revocations(conn):
+    """Revocations as the ledger recorded them, with the seq that fixes when
+    each took effect."""
+    out = []
+    for row in conn.execute(
+            "SELECT seq, entry_body FROM chain WHERE entry_type='revocation' "
+            "ORDER BY seq"):
+        if row["entry_body"]:
+            rev = json.loads(row["entry_body"])
+            rev["seq"] = row["seq"]
+            out.append(rev)
+    return out
+
+
+def _entry_seq_of_receipt(conn, receipt_id: str):
+    row = conn.execute("SELECT seq FROM chain WHERE entry_id=?",
+                       (receipt_id,)).fetchone()
+    return row["seq"] if row else None
+
+
+def signature_still_valid(conn, node_id: str, receipt_seq) -> bool:
+    """A signature counts if the ledger recorded it before it recorded the
+    revocation (design §9). No clock is consulted: a self-reported signing
+    time is exactly what a compromised key would forge.
+
+    A receipt not yet in the journal has no position to compare, so after a
+    revocation it cannot be counted — the benefit of the doubt would go to
+    whoever holds the stolen key."""
+    for rev in _revocations(conn):
+        if rev.get("node_id") != node_id:
+            continue
+        if receipt_seq is None or receipt_seq > rev["seq"]:
+            return False
+    return True
+
+
+def cmd_revoke(reason: str, successor: str = ""):
+    """Record that a key must no longer be trusted.
+
+    Nothing already written changes: the revocation is another fact, and the
+    ledger's order decides which signatures it reaches (Constitution IV)."""
+    if reason not in ("compromise", "rotation", "retirement"):
+        sys.exit("error: reason must be compromise, rotation or retirement")
+    conn = db()
+    try:
+        pub = identity_mod.public_key()
+    except identity_mod.SigningUnavailable as e:
+        sys.exit(f"error: no key to revoke ({e})")
+    nid = identity_mod.node_id_of(pub)
+    if reason == "rotation" and not successor:
+        sys.exit("error: rotation needs --successor (the node id taking over)")
+    if reason == "compromise" and successor:
+        sys.exit("error: a compromised key may not name its successor — "
+                 "whoever holds it would choose who inherits the history")
+    body = {"node_id": nid, "reason": reason, "declared_by": nid}
+    if successor:
+        body["successor_node_id"] = successor
+    payload = canonical(body)
+    body["signature"] = identity_mod.sign(payload, identity_mod.NS_REVOCATION)
+    entry = canonical(body)
+    head = _chain_append(conn, "revocation", "revocation:" + sha(entry)[:16],
+                         entry, _next_rule(conn))
+    conn.commit()
+    print(f"revocation recorded for {nid[:12]}… ({reason})")
+    print(f"chain head: {head}")
+    print("anchor this head now — until it is published, the revocation "
+          "protects nothing")
 
 
 def cmd_ore_scan():
@@ -2139,6 +2220,11 @@ def main():
                       choices=["build", "verify", "migrate", "status",
                                "checkpoint"])
 
+    prv = sub.add_parser("revoke", help="stop trusting this node's key")
+    prv.add_argument("reason", choices=["compromise", "rotation", "retirement"])
+    prv.add_argument("--successor", default="",
+                     help="node id inheriting the lineage (rotation only)")
+
     pid = sub.add_parser("identity", help="node key and id")
     pid.add_argument("action", choices=["init", "show"])
 
@@ -2218,6 +2304,8 @@ def main():
         cmd_chain_migrate()
     elif a.cmd == "chain" and a.action == "status":
         sys.exit(0 if cmd_chain_status() else 1)
+    elif a.cmd == "revoke":
+        cmd_revoke(a.reason, a.successor)
     elif a.cmd == "identity":
         cmd_identity(a.action)
     elif a.cmd == "import-verification":

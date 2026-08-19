@@ -1,6 +1,6 @@
 # EDEN Trust Layer 設計書（草案）
 
-状態: **Phase A / B 実装済み（2026-08-19）**。Phase C（meter attestation）は未着手
+状態: **Phase A / B / 失効 実装済み（2026-08-19）**。Phase C（meter attestation）は未着手
 日付: 2026-08-18
 対象: 第3次監査の未解決1〜3（Node/Receipt署名、Meter attestation、Verifier独立性）
 
@@ -615,3 +615,48 @@ entry_hash = SHA256("EDEN:" + type + ":v3|" + entry_id + "|" + canonical_body)
 
 既存chainは触らない（v1/v2のまま）。移行は `rule_change` として刻む —
 規則の版管理（§10）がそのまま使える。
+
+
+---
+
+## 16. 失効の実装 — 設計§9をコードへ（2026-08-19）
+
+§9で「時刻ではなく順序」と決めながら、**実装は存在していなかった**。
+`admits_to_record` が呼び出し0件だったのと同じ型の穴（設計と実経路の乖離）。
+
+### 16.1 実装
+
+```text
+eden revoke compromise|rotation|retirement [--successor <node_id>]
+  → revocation entry を chain へ追記（namespace eden-revocation で署名）
+
+signature_still_valid(node_id, receipt_seq):
+  失効の seq より後に台帳へ入った署名は数えない。時計は一切参照しない
+```
+
+- 新状態 **REVOKED**: 有効な署名だが、台帳が後に信頼を取り消した鍵のもの
+- **経済ゲートへ接続**: REVOKED は前線に参加できず、記録も保持できない
+- **compromise は後継を指名できない**（鍵を握った者が歴史の相続人を選べてしまう）
+- **rotation は successor 必須**
+
+### 16.2 判断: 台帳に未登録のレシートは失効後に数えない
+
+chain に入っていないレシートには比較すべき位置がない。
+ここで「疑わしきは有効」とすると、**盗まれた鍵を持つ側に利益が渡る**。
+だから未登録のレシートは失効後に SIGNED へ到達しない（テストで固定）。
+
+### 16.3 実測（テスト6本）
+
+```text
+失効前に台帳へ入った署名 : SIGNED    ← 過去は無傷（憲法IV）
+失効後に台帳へ入った署名 : REVOKED
+前線参加 / 記録保持       : どちらも拒否
+```
+
+### 16.4 副産物 — 規則移行の汎用化と、空台帳のバグ
+
+- `chain migrate` を「現規則 → 次に強い規則」へ汎用化。実台帳を **v3-bound-id** へ移行し、
+  作った規則が実際に使われる状態になった（未使用の規則をコードに残さない）
+- 移行の表示文が v1→v2 用にハードコードされ、**v3移行時に嘘を表示していた**ので修正
+- 失効テストが実装のバグを発見: **空の台帳で `chain build` を呼ぶと例外**。
+  初回起動時に誰でも踏む経路だった

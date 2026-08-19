@@ -289,3 +289,78 @@ class TestFrontierAdmission(unittest.TestCase):
         groups = self.eden.group_stats(self.conn, "fam")
         self.assertEqual(groups[0]["trust_floor"], "SIGNED")
         self.assertFalse(groups[0]["is_foreign"])
+
+
+class TestRevocation(unittest.TestCase):
+    """Revocation decided by the ledger's order, never by a claimed clock."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        os.environ["EDEN_HOME"] = self._dir.name
+        for mod in ("identity", "eden"):
+            sys.modules.pop(mod, None)
+        import identity, eden
+        identity.KEY_DIR = Path(self._dir.name)
+        identity.KEY_PATH = identity.KEY_DIR / "node_ed25519"
+        self.identity, self.eden = identity, eden
+        self.pub = identity.create_key("node")
+        eden.DB_PATH = Path(self._dir.name) / "t.db"
+        self.conn = eden.db()
+        eden._register_node(self.conn, self.pub, "local")
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def _run(self, fn, *a, **kw):
+        import io
+        from contextlib import redirect_stdout
+        with redirect_stdout(io.StringIO()):
+            return fn(*a, **kw)
+
+    def _signed_receipt(self, tag, energy):
+        body = {"runner_id": "r", "meter_id": "m", "runner_code_hash": "c",
+                "run_energy": {"energy_joules": energy},
+                "verification_energy": {"energy_joules": 0.1},
+                "uncertainty_profile": {"assigned_cv": 0.15}}
+        body["signatures"] = self.eden._sign_receipt_body(dict(body))
+        rj = self.eden.canonical(body)
+        h = self.eden.sha(rj)[:16]
+        self.conn.execute(
+            "INSERT INTO receipts(receipt_id, run_id, family_id, receipt_json, "
+            "receipt_hash, created_at) VALUES (?,?,?,?,?,?)",
+            (h, "run" + tag, "fam", rj, h, "2026-08-19T00:00:0" + tag))
+        self.conn.commit()
+        return body
+
+    def test_revocation_reaches_forward_only(self):
+        before = self._signed_receipt("1", 5.0)
+        self._run(self.eden.cmd_chain_build)
+        self._run(self.eden.cmd_revoke, "compromise")
+        after = self._signed_receipt("2", 6.0)
+        self._run(self.eden.cmd_chain_build)
+
+        self.assertEqual(
+            self.eden.trust_state_of(self.conn, before, "run1"), "SIGNED")
+        self.assertEqual(
+            self.eden.trust_state_of(self.conn, after, "run2"), "REVOKED")
+
+    def test_receipt_outside_the_journal_loses_after_revocation(self):
+        """Without a position in the journal there is nothing to compare, and
+        the doubt must not favour whoever holds the revoked key."""
+        self._run(self.eden.cmd_chain_build)
+        self._run(self.eden.cmd_revoke, "compromise")
+        unchained = self._signed_receipt("3", 7.0)   # never chained
+        self.assertEqual(
+            self.eden.trust_state_of(self.conn, unchained, "run3"), "REVOKED")
+
+    def test_revoked_receipts_are_refused_by_the_economic_layer(self):
+        self.assertFalse(self.eden._admits_to_frontier("REVOKED", "run1"))
+        self.assertFalse(self.eden.admits_to_record("REVOKED", False))
+
+    def test_compromised_key_may_not_name_a_successor(self):
+        with self.assertRaises(SystemExit):
+            self._run(self.eden.cmd_revoke, "compromise", "some-node")
+
+    def test_rotation_requires_a_successor(self):
+        with self.assertRaises(SystemExit):
+            self._run(self.eden.cmd_revoke, "rotation", "")

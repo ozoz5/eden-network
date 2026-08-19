@@ -159,13 +159,29 @@ class TestJournalMigration(unittest.TestCase):
         self.assertEqual(len(row["entry_hash"]), 64)
         self.assertTrue(self._run(eden.cmd_chain_verify))
 
-    def test_migration_is_idempotent(self):
+    def test_migration_advances_one_rule_at_a_time(self):
+        """Each call moves to the next rule up, and stops once there is no
+        stronger rule left — the journal never skips a version."""
         self._run(eden.cmd_chain_build)
         self._run(eden.cmd_chain_migrate)
-        n = self.conn.execute("SELECT COUNT(*) c FROM chain").fetchone()["c"]
+        self.assertEqual(eden._next_rule(self.conn), journal.DOMAIN_RULE)
         self._run(eden.cmd_chain_migrate)
+        self.assertEqual(eden._next_rule(self.conn), journal.BOUND_RULE)
+        n = self.conn.execute("SELECT COUNT(*) c FROM chain").fetchone()["c"]
+        self._run(eden.cmd_chain_migrate)   # nothing stronger exists
         self.assertEqual(
             self.conn.execute("SELECT COUNT(*) c FROM chain").fetchone()["c"], n)
+        self.assertTrue(self._run(eden.cmd_chain_verify))
+
+    def test_every_rule_change_is_recorded_once(self):
+        self._run(eden.cmd_chain_build)
+        self._run(eden.cmd_chain_migrate)
+        self._run(eden.cmd_chain_migrate)
+        changes = eden._rule_changes(self.conn)
+        targets = [c["new_rule"] for c in changes]
+        self.assertEqual(sorted(targets),
+                         sorted([journal.DOMAIN_RULE, journal.BOUND_RULE]))
+        self.assertEqual(journal.validate_rule_history(changes), [])
 
     def test_a_claimed_rule_cannot_override_history(self):
         self._run(eden.cmd_chain_build)

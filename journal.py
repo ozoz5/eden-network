@@ -48,6 +48,14 @@ def entry_hash(rule: str, entry_type: str, canonical_bytes: str,
     raise ValueError(f"unsupported hash rule: {rule}")
 
 
+def next_stronger_rule(current: str):
+    """The one rule a migration may move to: the next strength up. Skipping
+    versions would leave a gap no entry was ever written under."""
+    candidates = [r for r in SUPPORTED_RULES
+                  if RULE_STRENGTH[r] > RULE_STRENGTH.get(current, 0)]
+    return min(candidates, key=lambda r: RULE_STRENGTH[r]) if candidates else None
+
+
 def rule_at(rule_changes, seq: int) -> str:
     """Derived from the journal's own history, never from what an entry
     claims about itself (audit 2): an entry that named an unknown or weaker
