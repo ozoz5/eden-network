@@ -40,6 +40,7 @@ import challenge as challenge_mod
 import eligibility
 import identity as identity_mod
 import journal as journal_mod
+import valuation as valuation_mod
 import ore as ore_mod
 
 BASE = Path(__file__).resolve().parent
@@ -2247,6 +2248,52 @@ def cmd_attest():
     return not problems
 
 
+def cmd_valuation():
+    """What each valuation scheme would have issued for this ledger.
+
+    The spec calls cross-family valuation its largest open problem and
+    refuses to settle it by argument (§6.1). This prints the evidence the
+    decision should rest on; it changes nothing about what is minted."""
+    conn = db()
+    mints = []
+    for row in conn.execute("SELECT * FROM mints ORDER BY mint_id"):
+        mints.append({"mint_id": row["mint_id"], "family_id": row["family_id"],
+                      "gain_j": row["certified_gain_j"],
+                      "prev_j": row["prev_low_j"], "new_j": row["new_high_j"],
+                      "winner": row["new_group"]})
+    if not mints:
+        print("no mints recorded yet")
+        return
+    context = {"family_receipts": {
+        r["family_id"]: r["c"] for r in conn.execute(
+            "SELECT family_id, COUNT(*) c FROM receipts GROUP BY family_id")}}
+    normalised = valuation_mod.evaluate(mints, context)
+    shares = valuation_mod.family_shares(normalised, mints)
+
+    fams = sorted({m["family_id"] for m in mints})
+    print("share of all issuance, by family (each scheme normalised to 1.0)")
+    print(f"  {'family':<10}" + "".join(f"{s:>12}"
+                                        for s in valuation_mod.SCHEMES))
+    for fam in fams:
+        row = "".join(f"{shares[s].get(fam, 0.0)*100:>11.1f}%"
+                      for s in valuation_mod.SCHEMES)
+        print(f"  {fam[:8]:<10}{row}")
+
+    print()
+    print("per mint: improvement actually achieved vs share of issuance")
+    print(f"  {'mint':<5}{'family':<10}{'x cheaper':>10}"
+          + "".join(f"{s:>12}" for s in valuation_mod.SCHEMES))
+    for m in mints:
+        factor = (m["prev_j"] / m["new_j"]) if m["new_j"] else float("inf")
+        fx = "inf" if factor == float("inf") else f"{factor:.1f}x"
+        row = "".join(f"{normalised[s][m['mint_id']]*100:>11.1f}%"
+                      for s in valuation_mod.SCHEMES)
+        print(f"  {m['mint_id']:<5}{m['family_id'][:8]:<10}{fx:>10}{row}")
+    print()
+    print("nothing here is minted — this is the evidence for choosing "
+          "(spec §6.1), not a change to the rule")
+
+
 def cmd_ore_scan():
     """Seal receipts with the first epoch opened after them; keep the rare.
 
@@ -2349,6 +2396,9 @@ def main():
 
     sub.add_parser("verify-signatures", help="re-verify all ledger signatures")
 
+    sub.add_parser("valuation",
+                   help="what each cross-family scheme would issue")
+
     sub.add_parser("attest",
                    help="re-derive each receipt's energy from its own profile")
 
@@ -2432,6 +2482,8 @@ def main():
         cmd_identity(a.action)
     elif a.cmd == "import-verification":
         sys.exit(0 if cmd_import_verification(a.path) else 1)
+    elif a.cmd == "valuation":
+        cmd_valuation()
     elif a.cmd == "attest":
         sys.exit(0 if cmd_attest() else 1)
     elif a.cmd == "verify-signatures":
