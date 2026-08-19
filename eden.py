@@ -1498,8 +1498,43 @@ def cmd_challenge_report(epoch_prefix: str):
               f"total={r['total_j']:9.3f} J  J/success={jps}")
 
 
-def _cert_row_to_dict(row) -> dict:
+def _cert_observations(conn, epoch_id, runner_id, code_hash):
+    """Per-instance observations for one runner's stratum of one epoch.
+
+    Derived from the ledger every time it is needed rather than stored
+    beside the certificate: the instances an epoch issued are facts already
+    written down, and a second copy that pricing consults is a second place
+    the two could disagree."""
+    return [(row["energy_joules"] + (row["verify_j"] or 0.0),
+             row["status"] == "PASS", row["instance_index"])
+            for row in conn.execute(
+                """SELECT er.instance_index,
+                          m.energy_joules,
+                          COALESCE(v.verify_energy_joules,0) AS verify_j,
+                          COALESCE(v.status,'FAIL') AS status
+                   FROM epoch_runs er
+                   JOIN runs r ON r.run_id = er.run_id
+                   JOIN measurements m ON m.run_id = er.run_id
+                   LEFT JOIN verifications v ON v.run_id = er.run_id
+                   WHERE er.epoch_id=? AND er.runner_id=?
+                     AND r.runner_code_hash=?""",
+                (epoch_id, runner_id, code_hash))]
+
+
+def _cert_row_to_dict(row, conn=None) -> dict:
+    """A stored certificate, re-armed with the evidence it was drawn from.
+
+    The row holds the summary; the comparison needs the per-instance runs,
+    so they are re-derived and the resampled interval recomputed. Without
+    this the holder of a record arrives at every later comparison with no
+    interval at all, and the bootstrap silently degrades to the flat
+    margin — computed, printed, and then thrown away.
+    """
+    obs = (_cert_observations(conn, row["epoch_id"], row["runner_id"],
+                              row["runner_code_hash"]) if conn else None)
+    jps_ci = list(eligibility.bootstrap_jps(obs)) if obs else [None, None]
     return {
+        "observations": obs, "jps_ci95": jps_ci,
         "cert_id": row["cert_id"], "epoch_id": row["epoch_id"],
         "family_id": row["family_id"], "runner": row["runner_id"],
         "code_hash": row["runner_code_hash"], "meter": row["meter"],
@@ -1535,7 +1570,13 @@ def cmd_challenge_certify(epoch_prefix: str, commit: bool = False):
            JOIN measurements m ON m.run_id = er.run_id
            LEFT JOIN verifications v ON v.run_id = er.run_id
            WHERE er.epoch_id=?
-           GROUP BY er.runner_id, r.runner_code_hash, meter""",
+           GROUP BY er.runner_id, r.runner_code_hash, meter
+           -- Ledger order, stated rather than inherited from the planner:
+           -- certs enter the frontier one at a time, so the order they are
+           -- folded in decides which of them ever faces a record. A mint
+           -- that depends on an unstated GROUP BY order is not the pure
+           -- function of ledger order this command claims to be.
+           ORDER BY MIN(r.started_at), er.runner_id, r.runner_code_hash""",
         (eid,)).fetchall()
     if not aggs:
         sys.exit(f"error: epoch {eid} has no runs (run: eden challenge run)")
@@ -1560,26 +1601,15 @@ def cmd_challenge_certify(epoch_prefix: str, commit: bool = False):
         "SELECT runner_id, runner_code_hash FROM enrollments WHERE epoch_id=?",
         (eid,))}
 
-    existing = [_cert_row_to_dict(r) for r in conn.execute(
+    existing = [_cert_row_to_dict(r, conn) for r in conn.execute(
         "SELECT * FROM distribution_certs WHERE family_id=? ORDER BY created_at",
         (fam,))]
     print(f"epoch {eid}  family={fam}  certifying {len(aggs)} runner strata")
     for a in aggs:
         # Per-run observations, so the certificate carries a resampled
         # interval rather than a point estimate with a flat margin.
-        obs = [(row["energy_joules"] + (row["verify_j"] or 0.0),
-                row["status"] == "PASS")
-               for row in conn.execute(
-                   """SELECT m.energy_joules,
-                             COALESCE(v.verify_energy_joules,0) AS verify_j,
-                             COALESCE(v.status,'FAIL') AS status
-                      FROM epoch_runs er
-                      JOIN runs r ON r.run_id = er.run_id
-                      JOIN measurements m ON m.run_id = er.run_id
-                      LEFT JOIN verifications v ON v.run_id = er.run_id
-                      WHERE er.epoch_id=? AND er.runner_id=?
-                        AND r.runner_code_hash=?""",
-                   (eid, a["runner_id"], a["runner_code_hash"]))]
+        obs = _cert_observations(conn, eid, a["runner_id"],
+                                 a["runner_code_hash"])
         cert = eligibility.distribution_cert(
             eid, fam, a["runner_id"], a["runner_code_hash"], a["meter"],
             epoch["n_instances"], a["attempts"], a["successes"] or 0,
@@ -1655,7 +1685,10 @@ def cmd_challenge_certify(epoch_prefix: str, commit: bool = False):
                          "SIMULATED-DIST|" + ";".join(verdict.get("basis", [])),
                          now_iso()))
             conn.commit()
-            existing.append(cert)
+        # Outside the commit branch on purpose: an analysis run has to fold
+        # each cert into the frontier exactly as a committing run would, or
+        # it previews a weaker rule than the one that will be applied.
+        existing.append(cert)
     if not commit:
         print("\n  (analysis only — rerun with --commit to register certs/mints)")
 

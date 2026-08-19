@@ -195,6 +195,42 @@ So "the cascade beat brute-force search" was over-read from twelve runs;
 the resampling. Minting now requires the intervals to separate, which is
 why the first claim no longer earns anything.
 
+*Paired against the issued instances (2026-08-19).* An epoch issues the
+same instances to every strategy, and instances differ in difficulty. Two
+separately-widened intervals charge that shared difficulty to each strategy
+twice and then ask whether they happen to miss each other. Drawing the
+instance set once and letting both strategies face the same draw removes
+the part of the variation that belongs to the epoch:
+
+```text
+                                unpaired intervals      paired difference
+1.5b vs 7b  (token bugs)     [55,162] vs [213,1060]    Δ [-979, -118]  both
+1.5b vs 7b  (semantic bugs)  [62,435] vs [300, inf]    Δ [-inf,  -52]  paired only
+```
+
+On the semantic-bug epoch the unpaired intervals overlap and the paired
+difference does not: the small model's advantage was there, and the
+unpaired test could not see it. The success-rate axis gets the same
+treatment, by exact McNemar over the instances the two disagree on — phi4
+solved five instances the cascade missed and missed none the cascade
+solved (p = 0.031), which no Wilson interval on 11/12 against 6/12 will
+show.
+
+This direction issues *more*, so it is worth saying plainly why it is not
+a loosened standard: the unpaired test was not conservative by design, it
+was the wrong instrument for a common-instance comparison, and being
+accidentally strict is not a safety property anyone should bank. Pairing
+is refused unless the two certificates come from the same epoch and every
+observation names the instance it was measured on — position in a list is
+not an identity.
+
+The same pass removed a mint. A record standing on **one success in six**
+had an interval running to infinity; a challenger overlapping it was
+certified anyway, because the record's interval was recomputed at write
+time and never survived the trip back out of the ledger, leaving only a
+flat 20% margin on point estimates to decide. Replayed under the current
+rule, that certification does not happen.
+
 Declared bias, as always: the bug vocabulary is a subset of the searcher's
 mutation vocabulary, so the cascade resolved everything in its cheap stages
 (its LLM stages never fired). On a distribution that defeats search, these

@@ -246,3 +246,135 @@ class TestBootstrapInterval(unittest.TestCase):
                                               12, 12, 12, 100.0, 0.0)
         self.assertIsNone(old_a["jps_ci95"][0])
         self.assertTrue(eligibility.certified_dominates(old_a, old_b))
+
+
+def _cert(epoch, runner, obs, successes=None, total_j=None):
+    """A certificate over keyed per-instance observations."""
+    succ = successes if successes is not None else sum(1 for o in obs if o[1])
+    tot = total_j if total_j is not None else sum(o[0] for o in obs)
+    return eligibility.distribution_cert(epoch, "fam", runner, "h", "m",
+                                         len(obs), len(obs), succ, tot, 0.0,
+                                         observations=obs)
+
+
+class TestInstanceIsTheUnitOfResampling(unittest.TestCase):
+    """The epoch issued instances, not runs. Difficulty belongs to the
+    instance, so that is what a resample has to draw."""
+
+    def test_repeating_one_instance_does_not_narrow_the_interval(self):
+        # Four instances, each measured five times. Resampling runs would
+        # see twenty independent draws and report a confidence the epoch
+        # never supplied; resampling instances still sees four.
+        singles = [(1.0, True, 0), (2.0, True, 1), (3.0, True, 2),
+                   (9.0, True, 3)]
+        repeated = [(e, ok, i) for e, ok, i in singles for _ in range(5)]
+        w_single = eligibility.bootstrap_jps(singles)
+        w_repeat = eligibility.bootstrap_jps(repeated)
+        self.assertAlmostEqual(w_single[0], w_repeat[0], places=6)
+        self.assertAlmostEqual(w_single[1], w_repeat[1], places=6)
+
+    def test_unkeyed_observations_behave_as_before(self):
+        """Receipts that never recorded an instance are one run per cluster,
+        which is exactly what the old resampler assumed."""
+        obs = [(1.0, True), (2.0, True), (3.0, True), (9.0, True)]
+        keyed = [(e, ok, i) for i, (e, ok) in enumerate(obs)]
+        self.assertEqual(eligibility.bootstrap_jps(obs),
+                         eligibility.bootstrap_jps(keyed))
+
+
+class TestPairedComparison(unittest.TestCase):
+    EASY_HARD = [(10.0, True, 0), (10.0, True, 1), (10.0, False, 2),
+                 (10.0, False, 3), (10.0, True, 4), (10.0, False, 5)]
+
+    def test_position_in_a_list_is_not_an_instance(self):
+        """Pairing by array index would invent the structure the paired test
+        exists to exploit. Without instance keys there is no pairing."""
+        a = [(1.0, True), (1.0, True), (1.0, True), (1.0, True)]
+        b = [(1.2, True), (1.2, True), (1.2, True), (1.2, True)]
+        ca, cb = _cert("e" * 16, "A", a), _cert("e" * 16, "B", b)
+        self.assertIsNone(eligibility._paired(ca, cb))
+
+    def test_different_epochs_are_never_paired(self):
+        obs_a = [(1.0, True, i) for i in range(6)]
+        obs_b = [(2.0, True, i) for i in range(6)]
+        self.assertIsNone(eligibility._paired(_cert("a" * 16, "A", obs_a),
+                                              _cert("b" * 16, "B", obs_b)))
+
+    def test_different_instance_sets_are_never_paired(self):
+        obs_a = [(1.0, True, i) for i in range(6)]
+        obs_b = [(2.0, True, i) for i in range(1, 7)]
+        self.assertIsNone(eligibility._paired(_cert("e" * 16, "A", obs_a),
+                                              _cert("e" * 16, "B", obs_b)))
+
+    def test_shared_difficulty_cancels_and_certifies(self):
+        """Both runners fail the same hard instances and one is uniformly
+        cheaper on the rest. Unpaired, the shared failures widen both
+        intervals until they overlap; paired, they cancel."""
+        a = [(2.0, ok, i) for _, ok, i in self.EASY_HARD]
+        b = [(8.0, ok, i) for _, ok, i in self.EASY_HARD]
+        ca, cb = _cert("e" * 16, "A", a), _cert("e" * 16, "B", b)
+        self.assertGreater(ca["jps_ci95"][1], cb["jps_ci95"][0])  # overlap
+        ci = eligibility.paired_jps_delta_ci(a, b)
+        self.assertLess(ci[1], 0)
+        self.assertTrue(eligibility.certified_dominates(ca, cb))
+        self.assertTrue(any("paired" in x
+                            for x in eligibility.certification_basis(ca, cb)))
+
+    def test_a_draw_where_neither_succeeds_is_a_tie_not_a_dropped_round(self):
+        """Dropping those draws would flatter whichever runner more often
+        has a finite ratio — the same bias as dropping infinite ratios."""
+        a = [(1.0, i == 0, i) for i in range(6)]
+        b = [(1.0, i == 0, i) for i in range(6)]
+        ci = eligibility.paired_jps_delta_ci(a, b)
+        self.assertLessEqual(ci[0], 0.0)
+        self.assertGreaterEqual(ci[1], 0.0)   # identical runners: no winner
+
+
+class TestMcNemar(unittest.TestCase):
+    """Only the instances the two runners disagree on carry the comparison."""
+
+    def test_five_wins_none_lost_certifies(self):
+        a = [(1.0, True, i) for i in range(12)]
+        b = [(1.0, i >= 5, i) for i in range(12)]
+        p = eligibility.mcnemar_exact(a, b)
+        self.assertAlmostEqual(p, 1 / 32, places=6)
+        self.assertLess(p, eligibility.PAIRED_ALPHA)
+
+    def test_one_win_none_lost_does_not_certify(self):
+        a = [(1.0, True, i) for i in range(12)]
+        b = [(1.0, i >= 1, i) for i in range(12)]
+        self.assertGreaterEqual(eligibility.mcnemar_exact(a, b),
+                                eligibility.PAIRED_ALPHA)
+
+    def test_agreement_alone_never_certifies(self):
+        """Eleven shared successes and no disagreement is not evidence that
+        either runner is better."""
+        same = [(1.0, i < 11, i) for i in range(12)]
+        self.assertEqual(eligibility.mcnemar_exact(same, list(same)), 1.0)
+
+    def test_repeated_instances_have_no_paired_verdict(self):
+        a = [(1.0, True, 0), (1.0, False, 0), (1.0, True, 1)]
+        b = [(1.0, False, 0), (1.0, False, 0), (1.0, False, 1)]
+        self.assertIsNone(eligibility.mcnemar_exact(a, b))
+
+
+class TestVerdictDoesNotDependOnArgumentOrder(unittest.TestCase):
+    """Which of two runners you name first must not move the band. The
+    percentile indices used to sit one position off-centre, and off-centre
+    in the direction that certifies."""
+
+    A = [(10.0, True, 0), (12.0, True, 1), (30.0, False, 2),
+         (11.0, True, 3), (40.0, False, 4), (13.0, True, 5)]
+    B = [(20.0, True, 0), (25.0, False, 1), (60.0, False, 2),
+         (22.0, True, 3), (80.0, False, 4), (26.0, True, 5)]
+
+    def test_paired_difference_is_antisymmetric(self):
+        ab = eligibility.paired_jps_delta_ci(self.A, self.B)
+        ba = eligibility.paired_jps_delta_ci(self.B, self.A)
+        self.assertAlmostEqual(ab[0], -ba[1], places=9)
+        self.assertAlmostEqual(ab[1], -ba[0], places=9)
+
+    def test_two_runners_never_certify_over_each_other(self):
+        ca, cb = _cert("e" * 16, "A", self.A), _cert("e" * 16, "B", self.B)
+        self.assertFalse(eligibility.certified_dominates(ca, cb)
+                         and eligibility.certified_dominates(cb, ca))

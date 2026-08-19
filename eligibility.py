@@ -119,34 +119,138 @@ def wilson_interval(successes: int, attempts: int, z: float = Z_95):
     return (max(0.0, center - half), min(1.0, center + half))
 
 
+def _cluster(observations):
+    """Group observations by the instance they were measured on.
+
+    An observation is (energy, succeeded) or (energy, succeeded, instance).
+    Without an instance key each run is its own cluster, which is what the
+    older receipts imply and what the resampler used to assume."""
+    clusters = {}
+    for i, ob in enumerate(observations):
+        if len(ob) >= 3:
+            e, ok, inst = ob[0], ob[1], ob[2]
+        else:
+            e, ok, inst = ob[0], ob[1], f"#{i}"
+        clusters.setdefault(inst, []).append((float(e), bool(ok)))
+    return clusters
+
+
+def _pct_bounds(sorted_values, rounds):
+    """The 95% band as a pair of mirror order statistics.
+
+    int(0.025*(n-1)) and int(0.975*(n-1)) are not mirror indices, so the
+    band came out one position off-centre — and off-centre in the direction
+    that certifies. A verdict must not depend on which of two runners is
+    named first, so the two ends are taken the same distance from each end.
+    """
+    k = int(0.025 * rounds)
+    return sorted_values[k], sorted_values[rounds - 1 - k]
+
+
+def _jps(runs):
+    wins = sum(1 for _, ok in runs if ok)
+    return (sum(e for e, _ in runs) / wins) if wins else float("inf")
+
+
 def bootstrap_jps(observations, rounds: int = BOOTSTRAP_ROUNDS):
     """A confidence interval for joules-per-success, resampled from the runs
     themselves rather than assumed.
 
     J/success is a ratio of two quantities that both move: the energy spent
-    and how many attempts happened to succeed. Resampling the attempts keeps
-    those two tied together, which a margin on the point estimate cannot do.
-    A resample where nothing succeeds has no finite ratio, and is carried as
+    and how many attempts happened to succeed. Resampling keeps those two
+    tied together, which a margin on the point estimate cannot do. A
+    resample where nothing succeeds has no finite ratio, and is carried as
     infinity rather than dropped — discarding it would quietly flatter a
     runner that only sometimes succeeds.
 
-    observations: [(energy_joules, succeeded_bool), ...]
+    The unit of resampling is the INSTANCE, not the run. Instances are what
+    the protocol issued and what differ in difficulty; two attempts at the
+    same instance are not two independent draws from the epoch, and treating
+    them as such narrows the interval on evidence that was never there.
+    With one run per instance this is identical to resampling runs.
+
+    observations: [(energy_joules, succeeded_bool[, instance_key]), ...]
     """
     import random
-    n = len(observations)
+    clusters = _cluster(observations)
+    keys = sorted(clusters)
+    n = len(keys)
     if n == 0:
         return (0.0, float("inf"))
     rng = random.Random(BOOTSTRAP_SEED)
     ratios = []
     for _ in range(rounds):
-        sample = [observations[rng.randrange(n)] for _ in range(n)]
-        wins = sum(1 for _, ok in sample if ok)
-        total = sum(e for e, _ in sample)
-        ratios.append(total / wins if wins else float("inf"))
+        runs = []
+        for _ in range(n):
+            runs.extend(clusters[keys[rng.randrange(n)]])
+        ratios.append(_jps(runs))
     ratios.sort()
-    lo = ratios[int(0.025 * (rounds - 1))]
-    hi = ratios[int(0.975 * (rounds - 1))]
-    return (lo, hi)
+    return _pct_bounds(ratios, rounds)
+
+
+def paired_jps_delta_ci(obs_a, obs_b, rounds: int = BOOTSTRAP_ROUNDS):
+    """95% interval for J/success(a) - J/success(b) when both runners faced
+    the SAME issued instances.
+
+    Instance difficulty is shared: a hard instance costs both runners. An
+    unpaired comparison charges that shared difficulty to each runner
+    separately and then asks whether two inflated intervals happen to miss
+    each other. Drawing the instance set once and letting both runners face
+    the same draw removes the part of the variation that belongs to the
+    epoch rather than to either runner.
+
+    A draw where NEITHER runner succeeds is a tie (0.0), not a dropped
+    round: dropping it would flatter whichever runner more often has a
+    finite ratio. Returns None when the two are not actually paired.
+    """
+    import random
+    A, B = _cluster(obs_a), _cluster(obs_b)
+    keys = sorted(set(A) & set(B))
+    if not keys or set(A) != set(B):
+        return None
+    rng = random.Random(BOOTSTRAP_SEED)
+    n = len(keys)
+    deltas = []
+    for _ in range(rounds):
+        draw = [keys[rng.randrange(n)] for _ in range(n)]
+        ja = _jps([r for k in draw for r in A[k]])
+        jb = _jps([r for k in draw for r in B[k]])
+        if ja == float("inf") and jb == float("inf"):
+            deltas.append(0.0)
+        else:
+            deltas.append(ja - jb)
+    deltas.sort()
+    return _pct_bounds(deltas, rounds)
+
+
+def mcnemar_exact(obs_a, obs_b):
+    """One-sided exact p for 'a succeeds on more of the issued instances
+    than b', counting only the instances where they disagree.
+
+    The instances they both pass and both fail say nothing about which is
+    better; only the disagreements carry the comparison. Under the null each
+    disagreement is a coin flip, so the p-value is an exact binomial tail —
+    no resampling, no seed, no percentile approximation.
+
+    Requires exactly one run per instance for both (a repeated instance has
+    no single pass/fail to pair). Returns None when that does not hold.
+    """
+    A, B = _cluster(obs_a), _cluster(obs_b)
+    if set(A) != set(B) or not A:
+        return None
+    if any(len(A[k]) != 1 or len(B[k]) != 1 for k in A):
+        return None
+    a_wins = sum(1 for k in A if A[k][0][1] and not B[k][0][1])
+    b_wins = sum(1 for k in A if B[k][0][1] and not A[k][0][1])
+    n = a_wins + b_wins
+    if n == 0:
+        return 1.0
+    from math import comb
+    tail = sum(comb(n, k) for k in range(0, b_wins + 1))
+    return tail / (2 ** n)
+
+
+PAIRED_ALPHA = 0.05
 
 
 def distribution_cert(epoch_id, family_id, runner, code_hash, meter,
@@ -172,6 +276,9 @@ def distribution_cert(epoch_id, family_id, runner, code_hash, meter,
         "run_j": run_j, "verify_j": verify_j, "total_j": total,
         "j_per_success": jps,
         "jps_ci95": [jps_lo, jps_hi],
+        # Kept on the certificate so a later comparison can pair against it
+        # instead of asking two separately-inflated intervals to miss.
+        "observations": list(observations) if observations else None,
     }
 
 
@@ -201,42 +308,84 @@ def dominates(a, b) -> bool:
 def certified_dominates(a, b) -> bool:
     """Uncertainty-aware dominance (audit H4). Point-estimate Pareto is the
     OBSERVED frontier; minting demands more: no-worse on both axes AND
-    clearly-better beyond uncertainty on at least one — Wilson-interval
-    separation on success rate, or a declared margin on J/success."""
+    clearly-better beyond uncertainty on at least one."""
     if a["meter"] != b["meter"] or b["successes"] == 0:
         return False
     rate_ge = a["success_rate"] >= b["success_rate"]
     jps_le = a["j_per_success"] <= b["j_per_success"]
     if not (rate_ge and jps_le):
         return False
-    rate_sep = a["rate_ci95"][0] >= b["rate_ci95"][1]
-    jps_sep = _jps_separated(a, b)
-    return rate_sep or jps_sep
+    return bool(certification_basis(a, b))
 
 
-def _jps_separated(a, b) -> bool:
-    """Separation on energy: the challenger's whole interval below the
-    holder's. Falls back to the flat margin only for certificates written
-    before per-observation data was kept."""
+def _keyed(observations) -> bool:
+    """True only when every observation names the instance it was measured
+    on. Position in a list is not an identity: pairing by array index would
+    invent the very structure the paired test is supposed to exploit, and
+    would tighten an interval on a fiction."""
+    return bool(observations) and all(len(ob) >= 3 for ob in observations)
+
+
+def _paired(a, b):
+    """The two certificates' per-instance observations, if and only if they
+    are genuinely comparable pair-wise: same epoch, every observation keyed
+    by its instance, and the same set of issued instances faced by both.
+    Anything less is not a pairing and must fall back to the unpaired
+    test."""
+    if a.get("epoch_id") != b.get("epoch_id"):
+        return None
+    oa, ob = a.get("observations"), b.get("observations")
+    if not _keyed(oa) or not _keyed(ob):
+        return None
+    if set(_cluster(oa)) != set(_cluster(ob)):
+        return None
+    return oa, ob
+
+
+def _rate_separated(a, b) -> str:
+    """Which instrument, if any, certifies that a's success rate beats b's."""
+    pair = _paired(a, b)
+    if pair is not None:
+        p = mcnemar_exact(*pair)
+        if p is not None and p < PAIRED_ALPHA:
+            return (f"success-rate-certified (paired, McNemar exact "
+                    f"p={p:.4f} over shared instances)")
+    if a["rate_ci95"][0] >= b["rate_ci95"][1]:
+        return "success-rate-certified (Wilson CI separation, unpaired)"
+    return ""
+
+
+def _jps_separated(a, b) -> str:
+    """Which instrument, if any, certifies that a costs less per success.
+
+    Paired first: when both certificates come from the same epoch and faced
+    the same instances, the difference is measured on a shared draw and the
+    epoch's own difficulty cancels. Only when that is unavailable does the
+    unpaired interval separation apply, and only when THAT is unavailable
+    does the flat protocol margin — which is not a confidence interval and
+    is named as such."""
+    pair = _paired(a, b)
+    if pair is not None:
+        ci = paired_jps_delta_ci(*pair)
+        if ci is not None and ci[1] < 0:
+            return (f"energy-certified (paired bootstrap, "
+                    f"delta ci95 upper {ci[1]:.2f} < 0)")
     a_ci, b_ci = a.get("jps_ci95"), b.get("jps_ci95")
     if a_ci and b_ci and a_ci[1] is not None and b_ci[0] is not None:
-        return a_ci[1] < b_ci[0]
-    return a["j_per_success"] <= b["j_per_success"] * (1 - JPS_MARGIN)
+        if a_ci[1] < b_ci[0]:
+            return "energy-certified (bootstrap CI separation, unpaired)"
+        return ""
+    if a["j_per_success"] <= b["j_per_success"] * (1 - JPS_MARGIN):
+        return "energy-margin-certified (protocol margin, not a CI)"
+    return ""
 
 
 def certification_basis(a, b) -> list:
-    """Which axis certifies the dominance — named honestly: the J/success
-    margin is a protocol parameter, NOT a confidence interval (audit)."""
-    bases = []
-    if a["rate_ci95"][0] >= b["rate_ci95"][1]:
-        bases.append("success-rate-certified (Wilson CI separation)")
-    if _jps_separated(a, b):
-        a_ci, b_ci = a.get("jps_ci95"), b.get("jps_ci95")
-        if a_ci and b_ci and a_ci[1] is not None and b_ci[0] is not None:
-            bases.append("energy-certified (bootstrap CI separation)")
-        else:
-            bases.append("energy-margin-certified (protocol margin, not a CI)")
-    return bases
+    """Which axis certifies the dominance, and by which instrument — named
+    honestly, because a paired test, an unpaired interval and a flat margin
+    are three different claims about the same two numbers."""
+    return [basis for basis in (_rate_separated(a, b), _jps_separated(a, b))
+            if basis]
 
 
 def pareto_frontier(certs) -> list:

@@ -655,3 +655,42 @@ budgetはfamily定義と枠の大きさを誰かが決める必要がある（**
 （sandbagged genesis §6.9と結合すると新しい攻撃面になり得る）。
 **Phase 3のエージェント経済シミュレーションで実測して決める**という設計判断は変えない。
 今回作ったのはその実験の測定器であり、答えではない。
+
+### v0実装記録 追補15（2026-08-19 — 比較の単位はrunではなくinstanceだった）
+
+外部監査の「bootstrapがinstance難易度の非IID性を扱っていない」への解答。
+実測してから設計を決めた。詳細は `TRUST_LAYER_DESIGN.md` §21。
+
+**epochが発行したのはinstanceであり、runではない。** 難易度はinstanceに属し、
+難しいinstanceは全runnerを落とす。resampleの単位をinstanceへ移し（cluster
+bootstrap）、同一epoch内の比較は**instance集合を一度だけ引いて両者に同じ引きを
+見せる**paired比較にした。成功率の軸は離散二値なのでMcNemar厳密検定を使う。
+
+```text
+                                unpaired               paired
+1.5b vs 7b (token bugs)     [55,162] vs [213,1060]   Δ [-979, -118]  両方
+1.5b vs 7b (semantic bugs)  [62,435] vs [300, inf]   Δ [-inf,  -52]  pairedのみ
+phi4 vs cascade             11/12 vs 6/12 (Wilson重なり)  McNemar p=0.031
+```
+
+**pairedは発行を増やす向きの変更**である。正当化は「unpairedは保守的だったのでは
+なく、共通instance比較に対して道具が違っていた。偶然厳しいことは安全性ではない」。
+代わりにpairing成立条件を厳格化した（同一epoch・全観測がinstance keyを持つ・
+instance集合が完全一致）。**配列の位置は同一性ではない**という条件は、実装中に
+自分のテストが捕まえた欠陥から来ている。
+
+### 同じ調査で発行を1件取り消した
+
+記録保持者 `16c4b89c:codefix_llm` は**6回中1成功**で区間が無限まで伸びる。
+挑戦者の区間は完全に重なる。それでも旧コードは+502 CREDITを発行していた。
+bootstrap区間が**保存されず、DBから読み戻した記録保持者が区間を失って到着する**ため、
+点推定への20%固定marginだけが残っていたから。§20の原則どおり、保存もbackfillもせず
+**比較時に台帳から再導出**する形にした。
+
+台帳のコピーで3 epochを再生し、旧規則3 mint / 新規則4 mintを差分で確認。
+**本番台帳は書き換えていない** — 既存6件のnoteは `SIMULATED-DIST`（基準名なし）＝
+H4ゲート以前の規則で発行された履歴であり、憲法IVにより事実として残る。
+
+副産物: 分析実行がcommit実行より弱い規則をpreviewしていた（`existing.append` が
+`if commit:` の内側）、証明書を畳み込む順序が未指定だった（`ORDER BY` 追加）、
+そして乱数400件のfuzzで**区間が引数の順序に依存していた**（認定が通る向きへ1順序統計量ぶん）。

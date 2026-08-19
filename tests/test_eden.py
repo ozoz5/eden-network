@@ -177,3 +177,88 @@ class TestFamilyId(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _epoch_runs(conn, epoch, runner, obs, code="cafe01"):
+    """Write one epoch's runs for one runner: (instance, joules, passed)."""
+    for inst, j, ok in obs:
+        rid = f"{epoch}-{runner}-{inst}"
+        conn.execute("INSERT INTO runs(run_id, task_instance_id, runner_id, "
+                     "runner_code_hash, started_at, completed_at, status, "
+                     "output_json, output_hash) VALUES (?,?,?,?,?,?,?,?,?)",
+                     (rid, f"inst{inst}", runner, code, "t", "t", "OK", "{}", "h"))
+        conn.execute("INSERT INTO measurements(run_id, method, "
+                     "meter_profile_json, energy_boundary, cpu_seconds, "
+                     "wall_seconds, energy_joules, confidence) "
+                     "VALUES (?,?,?,?,?,?,?,?)",
+                     (rid, "estimated", '{"meter_profile_id":"m"}', "b",
+                      1.0, 1.0, j, "low"))
+        conn.execute("INSERT INTO verifications(run_id, verifier_id, "
+                     "verifier_spec_hash, status, score, verify_cpu_seconds, "
+                     "verify_energy_joules, verified_at) VALUES (?,?,?,?,?,?,?,?)",
+                     (rid, "v", "vh", "PASS" if ok else "FAIL", 1.0, 0.0,
+                      0.0, "t"))
+        conn.execute("INSERT INTO epoch_runs(epoch_id, run_id, instance_index, "
+                     "runner_id) VALUES (?,?,?,?)", (epoch, rid, inst, runner))
+    conn.commit()
+
+
+def _store_cert(conn, cert):
+    conn.execute("INSERT INTO distribution_certs VALUES (?,?,?,?,?,?,?,?,?,?,"
+                 "?,?,?,?,?,?,?)",
+                 (cert["cert_id"], cert["epoch_id"], cert["family_id"],
+                  cert["runner"], cert["code_hash"], cert["meter"],
+                  cert["n_instances"], cert["attempts"], cert["successes"],
+                  cert["success_rate"], cert["rate_ci95"][0],
+                  cert["rate_ci95"][1], cert["run_j"], cert["verify_j"],
+                  cert["total_j"],
+                  None if cert["j_per_success"] == float("inf")
+                  else cert["j_per_success"], "t"))
+    conn.commit()
+
+
+class TestRecordHolderKeepsItsEvidence(unittest.TestCase):
+    """A record read back from the ledger must arrive with the runs it was
+    drawn from. Without them the holder has no interval, and the comparison
+    silently degrades to the flat protocol margin — which is how a record
+    resting on one success in six certified a challenger it overlaps."""
+
+    HOLDER = [(0, 300.0, True)] + [(i, 100.0, False) for i in range(1, 6)]
+
+    def _stored_holder(self, conn):
+        import eligibility
+        obs = [(j, ok, i) for i, j, ok in self.HOLDER]
+        cert = eligibility.distribution_cert(
+            "epoch-old", "fam", "holder", "cafe01", "m", 6, 6, 1,
+            sum(j for _, j, _ in self.HOLDER), 0.0, observations=obs)
+        _epoch_runs(conn, "epoch-old", "holder", self.HOLDER)
+        _store_cert(conn, cert)
+        return conn.execute(
+            "SELECT * FROM distribution_certs WHERE epoch_id='epoch-old'"
+        ).fetchone()
+
+    def test_observations_are_rederived_from_the_ledger(self):
+        with TempLedger() as conn:
+            row = self._stored_holder(conn)
+            self.assertIsNone(eden._cert_row_to_dict(row)["jps_ci95"][0])
+            armed = eden._cert_row_to_dict(row, conn)
+            self.assertEqual(len(armed["observations"]), 6)
+            self.assertIsNotNone(armed["jps_ci95"][0])
+
+    def test_a_thin_record_no_longer_certifies_by_margin_alone(self):
+        """One success in six has an interval that runs to infinity. The
+        challenger's point estimate clears the 20% margin, and must still
+        lose to the overlap."""
+        import eligibility
+        with TempLedger() as conn:
+            holder = eden._cert_row_to_dict(self._stored_holder(conn), conn)
+            chal_obs = [(200.0, i < 4, i) for i in range(6)]
+            challenger = eligibility.distribution_cert(
+                "epoch-new", "fam", "chal", "beef02", "m", 6, 6, 4, 1200.0,
+                0.0, observations=chal_obs)
+            self.assertLessEqual(challenger["j_per_success"],
+                                 holder["j_per_success"] * 0.8)  # clears margin
+            self.assertEqual(holder["jps_ci95"][1], float("inf"))
+            self.assertGreater(challenger["jps_ci95"][1],
+                               holder["jps_ci95"][0])   # they overlap
+            self.assertFalse(eligibility.certified_dominates(challenger, holder))
