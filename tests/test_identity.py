@@ -206,3 +206,70 @@ class TestIndependentVerification(unittest.TestCase):
         ok, out = self._import(self._foreign_verification(receipt_hash="f" * 16))
         self.assertFalse(ok)
         self.assertIn("no receipt", out)
+
+
+class TestFrontierAdmission(unittest.TestCase):
+    """The trust layer must actually gate the economic layer, or the tiers
+    are decoration (design §12.2)."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        os.environ["EDEN_HOME"] = self._dir.name
+        for mod in ("identity", "eden"):
+            sys.modules.pop(mod, None)
+        import identity, eden
+        identity.KEY_DIR = Path(self._dir.name)
+        identity.KEY_PATH = identity.KEY_DIR / "node_ed25519"
+        self.identity, self.eden = identity, eden
+        self.pub = identity.create_key("node")
+        eden.DB_PATH = Path(self._dir.name) / "t.db"
+        self.conn = eden.db()
+        eden._register_node(self.conn, self.pub, "local")
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def _store(self, run_id, energy, state, signed=False):
+        body = {"runner_id": "r", "meter_id": "m", "runner_code_hash": "c",
+                "run_energy": {"energy_joules": energy},
+                "verification_energy": {"energy_joules": 0.1},
+                "uncertainty_profile": {"assigned_cv": 0.15}}
+        if signed:
+            body["signatures"] = self.eden._sign_receipt_body(dict(body))
+        rj = self.eden.canonical(body)
+        h = self.eden.sha(rj)[:16]
+        self.conn.execute(
+            "INSERT INTO receipts(receipt_id, run_id, family_id, receipt_json, "
+            "receipt_hash, created_at, trust_state) VALUES (?,?,?,?,?,?,?)",
+            (h + run_id, run_id, "fam", rj, h, "t", state))
+        self.conn.commit()
+
+    def _energies(self):
+        return sorted(g["mean"] for g in self.eden.group_stats(self.conn, "fam"))
+
+    def test_local_receipts_are_admitted(self):
+        self._store("run1", 5.0, "LOCAL")
+        self.assertEqual(self._energies(), [5.0])
+
+    def test_unsigned_foreign_receipt_is_not_priced(self):
+        self._store("ext-a", 0.001, "UNSIGNED")
+        self.assertEqual(self._energies(), [])
+
+    def test_invalid_receipt_is_refused_even_locally(self):
+        """A signature that does not verify is a failed claim; the ledger
+        must not quietly treat it as an honest measurement."""
+        self._store("run2", 0.001, "INVALID")
+        self.assertEqual(self._energies(), [])
+
+    def test_foreign_receipt_needs_a_signature_to_enter(self):
+        self._store("ext-b", 0.002, "LOCAL")   # foreign claiming local
+        self.assertEqual(self._energies(), [])
+
+    def test_signed_foreign_receipt_is_admitted(self):
+        self._store("ext-c", 3.0, "SIGNED", signed=True)
+        self.assertEqual(self._energies(), [3.0])
+
+    def test_record_requires_reproduction_for_foreign_results(self):
+        self.assertTrue(self.eden.admits_to_record("VERIFIED"))
+        self.assertFalse(self.eden.admits_to_record("UNSIGNED"))
+        self.assertFalse(self.eden.admits_to_record("INVALID"))

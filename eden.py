@@ -966,12 +966,45 @@ def group_stats(conn, family_id: str):
     just the ledger read plus delegation.
     """
     rows = conn.execute(
-        "SELECT receipt_json FROM receipts WHERE family_id=? "
-        "AND run_id NOT LIKE 'ext-%'", (family_id,)
-    ).fetchall()
-    # AUDIT C2: unsigned foreign receipts are stored as observation claims
-    # but never feed the frontier until signatures/attestation exist.
-    return eligibility.group_stats([json.loads(r["receipt_json"]) for r in rows])
+        "SELECT run_id, receipt_json, trust_state FROM receipts "
+        "WHERE family_id=?", (family_id,)).fetchall()
+    admitted = []
+    for r in rows:
+        rec = json.loads(r["receipt_json"])
+        state = r["trust_state"] or trust_state_of(conn, rec, r["run_id"])
+        if _admits_to_frontier(state, r["run_id"]):
+            admitted.append(rec)
+    return eligibility.group_stats(admitted)
+
+
+# What the trust layer is FOR: the economic layer has to consult it, or the
+# tiers are decoration (design §12.2).
+FRONTIER_ADMISSION = {
+    # local receipts: this ledger's own pipeline, honest about being unsigned
+    "LOCAL": True,
+    "SIGNED": True,
+    "VERIFIED": True,
+    # a signature that does not verify is a failed claim, not a measurement
+    "INVALID": False,
+    # imported and unsigned: kept as observation, never priced
+    "UNSIGNED": False,
+}
+
+
+def _admits_to_frontier(state: str, run_id: str) -> bool:
+    if not FRONTIER_ADMISSION.get(state, False):
+        return False
+    # A foreign receipt needs a signature to be admitted at all: LOCAL is a
+    # claim only this ledger's own pipeline is entitled to make.
+    if run_id.startswith("ext-") and state == "LOCAL":
+        return False
+    return True
+
+
+def admits_to_record(state: str) -> bool:
+    """Holding a record is a stronger claim than appearing on the chart:
+    an imported result must have been reproduced elsewhere (VERIFIED)."""
+    return state in ("LOCAL", "SIGNED", "VERIFIED")
 
 
 def _set_state(conn, fam, g):
