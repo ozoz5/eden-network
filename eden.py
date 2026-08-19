@@ -483,6 +483,18 @@ CREATE TABLE IF NOT EXISTS nodes(
   label TEXT,
   registered_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS verifications_independent(
+  vr_id TEXT PRIMARY KEY,
+  receipt_id TEXT NOT NULL,
+  receipt_hash TEXT NOT NULL,
+  verifier_spec_hash TEXT NOT NULL,
+  verdict TEXT NOT NULL,
+  node_id TEXT NOT NULL,
+  hw_fingerprint TEXT NOT NULL,
+  trust_basis TEXT NOT NULL,
+  vr_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS checkpoints(
   chain_head TEXT PRIMARY KEY,
   seq INTEGER NOT NULL,
@@ -1796,8 +1808,79 @@ def trust_state_of(conn, receipt: dict, run_id: str) -> str:
             continue
         if identity_mod.verify(canonical(body), sig.get("signature", ""),
                                sig.get("namespace", ""), row["public_key"]):
-            return "SIGNED"
+            return _verified_or_signed(conn, receipt)
     return "INVALID"
+
+
+def _verified_or_signed(conn, receipt: dict) -> str:
+    """VERIFIED means another machine re-ran the work and agreed — a claim
+    about reproduction, not about the quality of the meter (design §12)."""
+    row = conn.execute(
+        "SELECT hw_fingerprint FROM verifications_independent "
+        "WHERE receipt_hash=? AND verdict='PASS'",
+        (sha(canonical({k: v for k, v in receipt.items()
+                        if k != "signatures"}))[:16],)).fetchone()
+    if row is None:
+        # the receipt's stored hash covers the whole body including signatures
+        row = conn.execute(
+            "SELECT v.hw_fingerprint FROM verifications_independent v "
+            "JOIN receipts r ON r.receipt_id = v.receipt_id "
+            "WHERE r.receipt_json = ? AND v.verdict='PASS'",
+            (canonical(receipt),)).fetchone()
+    if row and row["hw_fingerprint"] != _hw_fingerprint_of(receipt):
+        return "VERIFIED"
+    return "SIGNED"
+
+
+def _hw_fingerprint_of(receipt: dict) -> str:
+    return eligibility.hw_fingerprint(receipt)
+
+
+def cmd_import_verification(path: str):
+    """Take in an independent verification produced on another machine.
+
+    What makes it independent is the hardware it ran on, not the wording of
+    the claim: a verification whose fingerprint matches the receipt's own is
+    the same machine agreeing with itself."""
+    conn = db()
+    payload = json.loads(Path(path).read_text())
+    if isinstance(payload, dict):
+        payload = [payload]
+    added = rejected = 0
+    for vr in payload:
+        rec_row = conn.execute(
+            "SELECT receipt_id, receipt_json FROM receipts WHERE receipt_hash=?",
+            (vr.get("receipt_hash", ""),)).fetchone()
+        if rec_row is None:
+            print(f"  rejected: no receipt with hash {vr.get('receipt_hash')}")
+            rejected += 1
+            continue
+        receipt = json.loads(rec_row["receipt_json"])
+        body = {k: v for k, v in vr.items() if k != "signature"}
+        pub = vr.get("public_key", "")
+        if not identity_mod.verify(canonical(body), vr.get("signature", ""),
+                                   identity_mod.NS_RECEIPT, pub):
+            print(f"  rejected: signature does not verify")
+            rejected += 1
+            continue
+        if vr.get("hw_fingerprint") == _hw_fingerprint_of(receipt):
+            print("  rejected: same hardware as the receipt — a machine "
+                  "confirming itself is not independent verification")
+            rejected += 1
+            continue
+        nid = _register_node(conn, pub, "witness-ephemeral")
+        vr_id = sha(canonical(vr))[:16]
+        conn.execute(
+            "INSERT OR IGNORE INTO verifications_independent VALUES "
+            "(?,?,?,?,?,?,?,?,?,?)",
+            (vr_id, rec_row["receipt_id"], vr["receipt_hash"],
+             vr.get("verifier_spec_hash", ""), vr.get("verdict", ""),
+             nid, vr.get("hw_fingerprint", ""),
+             vr.get("trust_basis", "unstated"), canonical(vr), now_iso()))
+        added += 1
+    conn.commit()
+    print(f"independent verifications: {added} accepted, {rejected} rejected")
+    return rejected == 0
 
 
 def cmd_verify_signatures():
@@ -1817,8 +1900,7 @@ def cmd_verify_signatures():
         conn.execute("UPDATE receipts SET trust_state=? WHERE receipt_id=?",
                      (state, row["receipt_id"]))
     conn.commit()
-    for state in ("LOCAL", "UNSIGNED", "INVALID", "SIGNED", "ATTESTED",
-                  "VERIFIED"):
+    for state in ("LOCAL", "UNSIGNED", "INVALID", "SIGNED", "VERIFIED"):
         if counts.get(state):
             print(f"  {state:<9}: {counts[state]}")
     print(f"invalid signatures: {bad}")
@@ -1944,6 +2026,10 @@ def main():
 
     sub.add_parser("verify-signatures", help="re-verify all ledger signatures")
 
+    piv = sub.add_parser("import-verification",
+                         help="ingest an independent verification")
+    piv.add_argument("path")
+
     por = sub.add_parser("ore", help="the cultural layer (v1 spec 13)")
     por.add_argument("action", choices=["scan", "list"])
 
@@ -2016,6 +2102,8 @@ def main():
         cmd_chain_status()
     elif a.cmd == "identity":
         cmd_identity(a.action)
+    elif a.cmd == "import-verification":
+        sys.exit(0 if cmd_import_verification(a.path) else 1)
     elif a.cmd == "verify-signatures":
         sys.exit(0 if cmd_verify_signatures() else 1)
     elif a.cmd == "chain" and a.action == "checkpoint":

@@ -1,6 +1,6 @@
 # EDEN Trust Layer 設計書（草案）
 
-状態: **Phase A 実装済み（2026-08-19）**。Phase B（WITNESS再検証→VERIFIED）/ C（attestation）は未着手
+状態: **Phase A / B 実装済み（2026-08-19）**。Phase C（meter attestation）は未着手
 日付: 2026-08-18
 対象: 第3次監査の未解決1〜3（Node/Receipt署名、Meter attestation、Verifier独立性）
 
@@ -427,3 +427,98 @@ namespace書換を試すと、いずれも拒否されるが結果が `LOCAL` �
 **Phase Aで到達していないもの（正直に）:** SIGNEDは「誰が言ったか」しか固定しない。
 ATTESTED（計測根拠）とVERIFIED（他ノードの再検証）は未実装であり、
 現在の1件は単一ノードの自己署名 — role_collapse=true をレシート自身が申告している。
+
+
+---
+
+## 12. trust_stateの2軸化（Phase B着手前の設計修正、2026-08-19）
+
+### 12.1 線形階梯は間違いだった
+
+§3は `SIGNED → ATTESTED → VERIFIED` という一本の階梯を定めていた。
+Phase Bを実装しようとして、それが**二つの無関係な問いを直列にしている**と分かった:
+
+```text
+「誰が言ったか」        署名（SIGNED）
+「他人が再現したか」    独立再検証（VERIFIED）   ← 主張の信頼度という同じ軸
+「計測器は証明済みか」  attestation              ← 測定の質という別の軸
+```
+
+線形にすると、meter attestation（実解はEDEN Cable = 物理ハードウェア）が
+存在するまで、**別ノードが再検証しても状態が上がらない**。
+2台目がある今、それは事実を捨てている。
+
+### 12.2 修正後
+
+```text
+trust_state (主張の信頼度、線形):
+  LOCAL     自台帳のパイプラインが生成、署名なし
+  UNSIGNED  輸入、署名なし
+  INVALID   署名を伴うが検証に失敗（正直な無署名と区別する — Phase A実測より）
+  SIGNED    有効なノード署名あり = 誰が言ったかが固定された
+  VERIFIED  SIGNED + 別ハードウェアのノードによる独立再検証
+
+meter attestation (測定の質、独立した属性):
+  既存の meter_class（S=推定 / V=OSカウンタ / P=物理計測）の延長に置く。
+  レシートの属性であり、主張の信頼度の階梯には含めない。
+```
+
+**eligibilityへの接続も変わる**: 前線更新に要求するのはVERIFIED（＝再現された）。
+測定の質はmeter層別（既存）が既に担っており、二重に階梯へ持ち込まない。
+
+### 12.3 Phase Bで作れるもの・作れないもの（先に宣言する）
+
+WITNESSは TwinLoop Relay の `shadow_verify_v1`（署名付きジョブ、任意コマンド不可、
+成果物はログ経由）でしか動かせない。**恒久的な鍵をWITNESSへ置く経路がない** —
+relayは任意ファイル書き込みを許さず、それは緩めるべきでない制約。
+
+したがってPhase Bで得られるのは:
+- **得られる**: 「別ハードウェアで、同じ検証仕様により、同じ結果が再現された」という事実。
+  jobごとに生成した鍵で署名され、その鍵の出所はrelayのtransport receipt（SHA-256付き）が担保する
+- **得られない**: WITNESSノードの恒久的同一性。鍵はjobごとに使い捨てで、
+  「同じノードが繰り返し検証している」ことは言えない
+
+**正直な帰結**: WITNESS由来の署名の信頼は、EDEN自身の暗号ではなく
+**TwinLoop relayのtransport認証に依存する**。EDENの台帳にはそう記録する
+（`verifier_trust_basis: "twinloop-relay-transport"`）。
+第三者verifierが恒久鍵を持って参加すれば、この依存は消える。
+
+
+---
+
+## 13. Phase B 実装記録 — 最初のVERIFIED（2026-08-19）
+
+WITNESS（M1 Air）が、FORGEのレシートを**自分で再検証して署名した**。
+
+```text
+対象レシート : counter_fast / family 2a8243b5b0f9f404 / output 73883d04ae2dcc7c
+WITNESS判定  : PASS（自分で仕様から入力を再生成し、runnerを再実行して到達）
+hw指紋       : 10f070（FORGE = f991f2）
+verifier_spec: FORGEの主張と一致
+trust_basis  : twinloop-relay-transport（宣言）
+```
+
+台帳: **VERIFIED 1 / SIGNED 1** — EDEN史上初のVERIFIEDレシート。
+
+### 13.1 独立性は言葉ではなくハードウェアで判定する
+
+`cmd_import_verification` が拒否するもの（実測、テスト4本で固定）:
+
+| 攻撃 | 結果 |
+|---|---|
+| 同一hw指紋での自己確認（**署名は有効**） | REJECTED — 機械が自分に頷くのは独立検証ではない |
+| verdict/出力hashの書換 | REJECTED（署名不一致） |
+| 存在しないレシートへの検証 | REJECTED |
+| 未登録鍵での主張 | REJECTED |
+
+最初の攻撃検査では、同一マシン攻撃が「署名不一致」で先に落ちて**検査の証明になっていなかった**。
+攻撃者の鍵で正しく署名し直した上で再攻撃し、同一マシン検査が単独で発火することを確認してから固定した。
+
+### 13.2 これで何が言えて、何が言えないか
+
+- **言える**: 別のハードウェアが、同じ検証仕様で、同じ結果に到達した
+- **言えない**: そのノードの恒久的同一性。鍵はjobごとの使い捨てで、
+  「同じWITNESSが繰り返し検証している」ことは主張できない
+- **依存**: この署名の出所はEDENの暗号ではなく**TwinLoop relayのtransport認証**。
+  台帳は `trust_basis: "twinloop-relay-transport"` としてその依存を記録する。
+  恒久鍵を持つ第三者verifierが参加すれば、この依存は消える
