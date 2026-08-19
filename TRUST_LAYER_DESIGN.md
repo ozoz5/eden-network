@@ -418,6 +418,12 @@ body = {from_seq: 148, field: "entry_hash", old_rule: "v1-legacy",
 **現在の台帳:** 149 entries / INTACT / LOCAL 141・UNSIGNED 6・**SIGNED 1**（史上初）/
 checkpoint署名済み head `6b6ba8f382fa6a03b14b647a6f99f291e7ededc386226d8396ea29e0f9b380e4`
 
+**テスト射程外を実測して見つけたもの（同日）:** 台帳経由で本体改竄・未登録node_id・
+namespace書換を試すと、いずれも拒否されるが結果が `LOCAL` — つまり
+**署名を偽ったレシートと、署名を付けていない正直なレシートが同じ状態に見えた**。
+失敗した主張を無署名として扱うのは詐称への加担なので、`INVALID` 状態を新設して分離。
+台帳経路のtrust_state判定をテスト5本で固定（identity層の単体テストでは届かない範囲）。
+
 **Phase Aで到達していないもの（正直に）:** SIGNEDは「誰が言ったか」しか固定しない。
 ATTESTED（計測根拠）とVERIFIED（他ノードの再検証）は未実装であり、
 現在の1件は単一ノードの自己署名 — role_collapse=true をレシート自身が申告している。

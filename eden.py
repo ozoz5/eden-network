@@ -1785,6 +1785,9 @@ def trust_state_of(conn, receipt: dict, run_id: str) -> str:
     sigs = receipt.get("signatures") or []
     if not sigs:
         return "UNSIGNED" if run_id.startswith("ext-") else "LOCAL"
+    # A receipt that carries a signature is making a claim. If the claim does
+    # not hold, saying "unsigned" would flatter it: an honest unsigned receipt
+    # and a forged one must not read the same.
     body = {k: v for k, v in receipt.items() if k != "signatures"}
     for sig in sigs:
         row = conn.execute("SELECT public_key FROM nodes WHERE node_id=?",
@@ -1794,7 +1797,7 @@ def trust_state_of(conn, receipt: dict, run_id: str) -> str:
         if identity_mod.verify(canonical(body), sig.get("signature", ""),
                                sig.get("namespace", ""), row["public_key"]):
             return "SIGNED"
-    return "UNSIGNED" if run_id.startswith("ext-") else "LOCAL"
+    return "INVALID"
 
 
 def cmd_verify_signatures():
@@ -1806,14 +1809,16 @@ def cmd_verify_signatures():
                             "FROM receipts ORDER BY created_at"):
         rec = json.loads(row["receipt_json"])
         state = trust_state_of(conn, rec, row["run_id"])
-        if rec.get("signatures") and state != "SIGNED":
-            print(f"  {row['receipt_id']}: signature present but INVALID")
+        if state == "INVALID":
+            print(f"  {row['receipt_id']}: carries a signature that does not "
+                  "verify — this is a failed claim, not an unsigned receipt")
             bad += 1
         counts[state] = counts.get(state, 0) + 1
         conn.execute("UPDATE receipts SET trust_state=? WHERE receipt_id=?",
                      (state, row["receipt_id"]))
     conn.commit()
-    for state in ("LOCAL", "UNSIGNED", "SIGNED", "ATTESTED", "VERIFIED"):
+    for state in ("LOCAL", "UNSIGNED", "INVALID", "SIGNED", "ATTESTED",
+                  "VERIFIED"):
         if counts.get(state):
             print(f"  {state:<9}: {counts[state]}")
     print(f"invalid signatures: {bad}")

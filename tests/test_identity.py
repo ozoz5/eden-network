@@ -64,3 +64,55 @@ class TestIdentity(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTrustStateThroughLedger(unittest.TestCase):
+    """The ledger path, not just the crypto helper: a broken claim must not
+    be indistinguishable from an honest unsigned receipt."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        os.environ["EDEN_HOME"] = self._dir.name
+        for mod in ("identity", "eden"):
+            sys.modules.pop(mod, None)
+        import identity, eden
+        identity.KEY_DIR = Path(self._dir.name)
+        identity.KEY_PATH = identity.KEY_DIR / "node_ed25519"
+        self.identity, self.eden = identity, eden
+        self.pub = identity.create_key("test")
+        eden.DB_PATH = Path(self._dir.name) / "t.db"
+        self.conn = eden.db()
+        eden._register_node(self.conn, self.pub, "local")
+        body = {"run_energy": {"energy_joules": 1.0}}
+        self.receipt = dict(body)
+        self.receipt["signatures"] = eden._sign_receipt_body(body)
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def test_valid_receipt_is_signed(self):
+        self.assertEqual(
+            self.eden.trust_state_of(self.conn, self.receipt, "run1"), "SIGNED")
+
+    def test_tampered_body_is_invalid_not_unsigned(self):
+        evil = json.loads(json.dumps(self.receipt))
+        evil["run_energy"]["energy_joules"] = 0.0001
+        self.assertEqual(
+            self.eden.trust_state_of(self.conn, evil, "run1"), "INVALID")
+
+    def test_unregistered_node_is_invalid(self):
+        evil = json.loads(json.dumps(self.receipt))
+        evil["signatures"][0]["node_id"] = "f" * 64
+        self.assertEqual(
+            self.eden.trust_state_of(self.conn, evil, "run1"), "INVALID")
+
+    def test_namespace_rewrite_is_invalid(self):
+        evil = json.loads(json.dumps(self.receipt))
+        evil["signatures"][0]["namespace"] = self.identity.NS_CHECKPOINT
+        self.assertEqual(
+            self.eden.trust_state_of(self.conn, evil, "run1"), "INVALID")
+
+    def test_honest_unsigned_receipt_stays_local(self):
+        self.assertEqual(
+            self.eden.trust_state_of(self.conn, {"signatures": []}, "run1"),
+            "LOCAL")
