@@ -14,11 +14,17 @@ import eden
 
 
 def _receipt(runner, meter, energy, verify=0.2, cv=0.15, code="cafe01"):
+    """Shaped like a real receipt: the energy must be re-derivable from the
+    profile, because that is what pricing now requires."""
+    watts = 6.0
     return json.dumps({
         "runner_id": runner, "meter_id": meter, "runner_code_hash": code,
-        "run_energy": {"energy_joules": energy},
+        "run_energy": {"energy_joules": energy, "cpu_seconds": energy / watts,
+                       "wall_seconds": energy / watts},
         "verification_energy": {"energy_joules": verify},
         "uncertainty_profile": {"assigned_cv": cv},
+        "measurement_profile": {"method": "estimated",
+                                "watts_per_cpu_second_assumed": watts},
     })
 
 

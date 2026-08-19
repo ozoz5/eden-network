@@ -230,10 +230,16 @@ class TestFrontierAdmission(unittest.TestCase):
         self._dir.cleanup()
 
     def _store(self, run_id, energy, state, signed=False):
+        watts = 6.0
         body = {"runner_id": "r", "meter_id": "m", "runner_code_hash": "c",
-                "run_energy": {"energy_joules": energy},
+                "run_energy": {"energy_joules": energy,
+                               "cpu_seconds": energy / watts,
+                               "wall_seconds": energy / watts},
                 "verification_energy": {"energy_joules": 0.1},
-                "uncertainty_profile": {"assigned_cv": 0.15}}
+                "uncertainty_profile": {"assigned_cv": 0.15},
+                "measurement_profile": {
+                    "method": "estimated",
+                    "watts_per_cpu_second_assumed": watts}}
         if signed:
             body["signatures"] = self.eden._sign_receipt_body(dict(body))
         rj = self.eden.canonical(body)
@@ -257,8 +263,70 @@ class TestFrontierAdmission(unittest.TestCase):
 
     def test_invalid_receipt_is_refused_even_locally(self):
         """A signature that does not verify is a failed claim; the ledger
-        must not quietly treat it as an honest measurement."""
-        self._store("run2", 0.001, "INVALID")
+        must not quietly treat it as an honest measurement.
+
+        The forgery is real rather than a label in a column: pricing derives
+        the state from the receipt body, so writing "INVALID" in the cache
+        would prove nothing about the rule."""
+        watts = 6.0
+        body = {"runner_id": "r", "meter_id": "m", "runner_code_hash": "c",
+                "run_energy": {"energy_joules": 5.0, "cpu_seconds": 5.0 / watts,
+                               "wall_seconds": 5.0 / watts},
+                "verification_energy": {"energy_joules": 0.1},
+                "uncertainty_profile": {"assigned_cv": 0.15},
+                "measurement_profile": {
+                    "method": "estimated",
+                    "watts_per_cpu_second_assumed": watts}}
+        signed = dict(body)
+        signed["signatures"] = self.eden._sign_receipt_body(body)
+        # keep the signature, restate the energy: coherent, but not signed
+        # for what it now says
+        signed["run_energy"] = {"energy_joules": 0.001,
+                                "cpu_seconds": 0.001 / watts,
+                                "wall_seconds": 0.001 / watts}
+        rj = self.eden.canonical(signed)
+        h = self.eden.sha(rj)[:16]
+        self.conn.execute(
+            "INSERT INTO receipts(receipt_id, run_id, family_id, receipt_json, "
+            "receipt_hash, created_at) VALUES (?,?,?,?,?,?)",
+            (h, "run2", "fam", rj, h, "t"))
+        self.conn.commit()
+        self.assertEqual(
+            self.eden.trust_state_of(self.conn, signed, "run2"), "INVALID")
+        self.assertEqual(self._energies(), [])
+
+    def test_stored_state_cannot_launder_a_receipt(self):
+        """The cache columns are for display. If they could decide value,
+        writing in them would be the cheapest attack in the system."""
+        self._store("run3", 0.0002, "SIGNED")     # claims signed, is not
+        self.conn.execute("UPDATE receipts SET meter_coherence='coherent', "
+                          "trust_state='VERIFIED' WHERE run_id='run3'")
+        self.conn.commit()
+        # honest re-derivation: unsigned local receipt, energy re-derivable
+        self.assertEqual(
+            self.eden.trust_state_of(
+                self.conn,
+                __import__("json").loads(self.conn.execute(
+                    "SELECT receipt_json FROM receipts WHERE run_id='run3'"
+                ).fetchone()["receipt_json"]), "run3"), "LOCAL")
+
+    def test_unverifiable_meter_is_not_priced(self):
+        """An unknown method cannot be re-derived, and an unverifiable claim
+        must not be worth more than a verifiable one."""
+        body = {"runner_id": "r", "meter_id": "m", "runner_code_hash": "c",
+                "run_energy": {"energy_joules": 0.0001, "cpu_seconds": 0.5,
+                               "wall_seconds": 0.5},
+                "verification_energy": {"energy_joules": 0.1},
+                "uncertainty_profile": {"assigned_cv": 0.15},
+                "measurement_profile": {"method": "oracle-9000"}}
+        rj = self.eden.canonical(body)
+        h = self.eden.sha(rj)[:16]
+        self.conn.execute(
+            "INSERT INTO receipts(receipt_id, run_id, family_id, receipt_json, "
+            "receipt_hash, created_at) VALUES (?,?,?,?,?,?)",
+            (h, "run4", "fam", rj, h, "t"))
+        self.conn.commit()
+        self.assertEqual(self.eden.meter_coherence(body)[0], "unknown")
         self.assertEqual(self._energies(), [])
 
     def test_foreign_receipt_needs_a_signature_to_enter(self):

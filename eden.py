@@ -974,8 +974,12 @@ def group_stats(conn, family_id: str):
     admitted, trust = [], {}
     for r in rows:
         rec = json.loads(r["receipt_json"])
-        state = r["trust_state"] or trust_state_of(conn, rec, r["run_id"])
-        coherence = r["meter_coherence"] or meter_coherence(rec)[0]
+        # Pricing never trusts the stored columns: they are a cache for
+        # display, and a cache that decides value is a place to write a lie.
+        # Signature, revocation and coherence are re-derived from the receipt
+        # body every time it is priced.
+        state = trust_state_of(conn, rec, r["run_id"])
+        coherence = meter_coherence(rec)[0]
         if not _admits_to_frontier(state, r["run_id"], coherence):
             continue
         admitted.append(rec)
@@ -1016,9 +1020,11 @@ FRONTIER_ADMISSION = {
 
 def _admits_to_frontier(state: str, run_id: str,
                         coherence: str = "coherent") -> bool:
-    if coherence == "incoherent":
-        # A receipt whose own profile contradicts its energy is not a
-        # measurement, whoever signed it.
+    # Only a receipt whose energy can be re-derived from its own profile is
+    # priced. "incoherent" contradicts itself; "unknown" cannot be checked at
+    # all, and an unverifiable claim must not be worth more than a verifiable
+    # one — otherwise naming an unknown meter is the cheapest way in.
+    if coherence != "coherent":
         return False
     if not FRONTIER_ADMISSION.get(state, False):
         return False
