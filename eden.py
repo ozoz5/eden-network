@@ -291,8 +291,10 @@ class PowermetricsAdapter(MeasurementAdapter):
             "raw_observable": "powermetrics Combined Power (CPU+GPU+ANE) mW "
                               f"@ {self.INTERVAL_MS}ms + child cpu_seconds",
             "interval_ms": self.INTERVAL_MS,
-            "mean_active_mw": round(self._mean_active, 1),
-            "mean_idle_mw": round(self._mean_idle, 1),
+            # Not rounded: these are what a re-derivation of the energy must
+            # start from, and a value rounded for display cannot be checked.
+            "mean_active_mw": self._mean_active,
+            "mean_idle_mw": self._mean_idle,
             "n_samples_active": len(self._active),
             "n_samples_idle": len(self._idle),
             "fallback_to_estimated": self._fallback,
@@ -552,7 +554,7 @@ def db() -> sqlite3.Connection:
             conn.execute(f"ALTER TABLE chain RENAME COLUMN {old} TO {new}")
         except sqlite3.OperationalError:
             pass
-    for col in ("trust_state",):
+    for col in ("trust_state", "meter_coherence"):
         try:
             conn.execute(f"ALTER TABLE receipts ADD COLUMN {col} TEXT")
         except sqlite3.OperationalError:
@@ -966,13 +968,14 @@ def group_stats(conn, family_id: str):
     just the ledger read plus delegation.
     """
     rows = conn.execute(
-        "SELECT run_id, receipt_json, trust_state FROM receipts "
-        "WHERE family_id=?", (family_id,)).fetchall()
+        "SELECT run_id, receipt_json, trust_state, meter_coherence "
+        "FROM receipts WHERE family_id=?", (family_id,)).fetchall()
     admitted, trust = [], {}
     for r in rows:
         rec = json.loads(r["receipt_json"])
         state = r["trust_state"] or trust_state_of(conn, rec, r["run_id"])
-        if not _admits_to_frontier(state, r["run_id"]):
+        coherence = r["meter_coherence"] or meter_coherence(rec)[0]
+        if not _admits_to_frontier(state, r["run_id"], coherence):
             continue
         admitted.append(rec)
         key = (rec.get("runner_id"), rec.get("runner_code_hash", ""),
@@ -1010,7 +1013,12 @@ FRONTIER_ADMISSION = {
 }
 
 
-def _admits_to_frontier(state: str, run_id: str) -> bool:
+def _admits_to_frontier(state: str, run_id: str,
+                        coherence: str = "coherent") -> bool:
+    if coherence == "incoherent":
+        # A receipt whose own profile contradicts its energy is not a
+        # measurement, whoever signed it.
+        return False
     if not FRONTIER_ADMISSION.get(state, False):
         return False
     # A foreign receipt needs a signature to be admitted at all: LOCAL is a
@@ -2147,6 +2155,76 @@ def cmd_revoke(reason: str, successor: str = ""):
           "protects nothing")
 
 
+# Rounding in older profiles: mean power was stored to one decimal, so a
+# re-derivation can only match within the error that rounding introduced.
+_MW_ROUNDING_HALF = 0.05
+
+
+def meter_coherence(receipt: dict):
+    """Re-derive the claimed energy from the meter profile the receipt itself
+    carries.
+
+    This does not show the measurement was true — a fabricated profile can be
+    made consistent with a fabricated energy. It shows the receipt agrees with
+    itself, which is the floor beneath attestation, not a substitute for it
+    (real attestation needs a meter EDEN does not own).
+
+    Returns (verdict, detail): verdict in {coherent, incoherent, unknown}.
+    """
+    p = receipt.get("measurement_profile") or {}
+    e = receipt.get("run_energy") or {}
+    method, claimed = p.get("method"), e.get("energy_joules")
+    if claimed is None:
+        return "unknown", "no energy recorded"
+    if claimed < 0:
+        return "incoherent", "negative energy"
+    if method == "estimated":
+        watts = p.get("watts_per_cpu_second_assumed")
+        if watts is None:
+            return "unknown", "profile states no assumed power"
+        derived = e.get("cpu_seconds", 0.0) * watts
+        tol = max(abs(claimed) * 1e-9, 1e-12)
+    elif method == "os-counter":
+        for k in ("mean_active_mw", "mean_idle_mw"):
+            if p.get(k) is None:
+                return "unknown", f"profile states no {k}"
+        net_mw = p["mean_active_mw"] - p["mean_idle_mw"]
+        if net_mw < 0:
+            return "incoherent", "active power below idle baseline"
+        wall = e.get("wall_seconds", 0.0)
+        derived = net_mw / 1000.0 * wall
+        # two rounded means -> the derivation can drift by this much
+        tol = (2 * _MW_ROUNDING_HALF) / 1000.0 * wall + abs(claimed) * 1e-9
+    else:
+        return "unknown", f"no derivation defined for method {method!r}"
+    if abs(derived - claimed) <= tol:
+        return "coherent", f"re-derived {derived:.9f}"
+    return "incoherent", (f"claims {claimed:.9f}, profile yields "
+                          f"{derived:.9f} (tolerance {tol:.9f})")
+
+
+def cmd_attest():
+    """Check every receipt against the meter profile it carries."""
+    conn = db()
+    counts, problems = {}, []
+    for row in conn.execute("SELECT receipt_id, receipt_json FROM receipts"):
+        verdict, detail = meter_coherence(json.loads(row["receipt_json"]))
+        counts[verdict] = counts.get(verdict, 0) + 1
+        if verdict == "incoherent":
+            problems.append((row["receipt_id"], detail))
+        conn.execute("UPDATE receipts SET meter_coherence=? WHERE receipt_id=?",
+                     (verdict, row["receipt_id"]))
+    conn.commit()
+    for verdict in ("coherent", "unknown", "incoherent"):
+        if counts.get(verdict):
+            print(f"  {verdict:<11}: {counts[verdict]}")
+    for rid, detail in problems:
+        print(f"    {rid}: {detail}")
+    print("note: coherence is the receipt agreeing with itself. Attestation "
+          "of the meter needs hardware EDEN does not own (design §0).")
+    return not problems
+
+
 def cmd_ore_scan():
     """Seal receipts with the first epoch opened after them; keep the rare.
 
@@ -2249,6 +2327,9 @@ def main():
 
     sub.add_parser("verify-signatures", help="re-verify all ledger signatures")
 
+    sub.add_parser("attest",
+                   help="re-derive each receipt's energy from its own profile")
+
     piv = sub.add_parser("import-verification",
                          help="ingest an independent verification")
     piv.add_argument("path")
@@ -2329,6 +2410,8 @@ def main():
         cmd_identity(a.action)
     elif a.cmd == "import-verification":
         sys.exit(0 if cmd_import_verification(a.path) else 1)
+    elif a.cmd == "attest":
+        sys.exit(0 if cmd_attest() else 1)
     elif a.cmd == "verify-signatures":
         sys.exit(0 if cmd_verify_signatures() else 1)
     elif a.cmd == "chain" and a.action == "checkpoint":
