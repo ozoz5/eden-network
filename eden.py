@@ -968,13 +968,30 @@ def group_stats(conn, family_id: str):
     rows = conn.execute(
         "SELECT run_id, receipt_json, trust_state FROM receipts "
         "WHERE family_id=?", (family_id,)).fetchall()
-    admitted = []
+    admitted, trust = [], {}
     for r in rows:
         rec = json.loads(r["receipt_json"])
         state = r["trust_state"] or trust_state_of(conn, rec, r["run_id"])
-        if _admits_to_frontier(state, r["run_id"]):
-            admitted.append(rec)
-    return eligibility.group_stats(admitted)
+        if not _admits_to_frontier(state, r["run_id"]):
+            continue
+        admitted.append(rec)
+        key = (rec.get("runner_id"), rec.get("runner_code_hash", ""),
+               rec.get("meter_id"), eligibility.hw_fingerprint(rec))
+        seen = trust.setdefault(key, {"states": set(), "foreign": False})
+        seen["states"].add(state)
+        seen["foreign"] = seen["foreign"] or r["run_id"].startswith("ext-")
+    groups = eligibility.group_stats(admitted)
+    for g in groups:
+        key = (g["runner"], g["code_hash"], g["meter"], g["hw"])
+        info = trust.get(key, {"states": {"LOCAL"}, "foreign": False})
+        g["trust_states"] = sorted(info["states"])
+        g["is_foreign"] = info["foreign"]
+        # A group is only as trustworthy as its weakest member.
+        order = ["LOCAL", "SIGNED", "VERIFIED"]
+        g["trust_floor"] = min(info["states"],
+                               key=lambda st: order.index(st)
+                               if st in order else -1)
+    return groups
 
 
 # What the trust layer is FOR: the economic layer has to consult it, or the
@@ -1001,9 +1018,14 @@ def _admits_to_frontier(state: str, run_id: str) -> bool:
     return True
 
 
-def admits_to_record(state: str) -> bool:
-    """Holding a record is a stronger claim than appearing on the chart:
-    an imported result must have been reproduced elsewhere (VERIFIED)."""
+def admits_to_record(state: str, is_foreign: bool) -> bool:
+    """Holding a record is a stronger claim than appearing on the chart.
+
+    A result from another ledger must have been reproduced on other hardware
+    before it can hold the record here — its own signature only says who
+    made the claim, not that the work happened."""
+    if is_foreign:
+        return state == "VERIFIED"
     return state in ("LOCAL", "SIGNED", "VERIFIED")
 
 
@@ -1045,6 +1067,12 @@ def cmd_frontier(task_prefix: str, commit: bool = False):
     if state is None:
         if not commit:
             return
+        if not admits_to_record(candidate.get("trust_floor", "LOCAL"),
+                                candidate.get("is_foreign", False)):
+            print(f"\n  no record established: {candidate['group']} — "
+                  f"trust {candidate.get('trust_floor')} is not enough to hold "
+                  "a record (foreign results need independent reproduction)")
+            return
         rec = eligibility.assess_record(candidate)
         if not rec["eligible"]:
             print(f"\n  no record established: {candidate['group']} — "
@@ -1081,6 +1109,13 @@ def cmd_frontier(task_prefix: str, commit: bool = False):
               f"[{holder['low']:.3f}, {holder['high']:.3f}] J")
         return
 
+    # Trust gates the record before any statistics are consulted.
+    if not admits_to_record(candidate.get("trust_floor", "LOCAL"),
+                            candidate.get("is_foreign", False)):
+        print(f"\n  challenger {candidate['group']} cannot hold a record: "
+              f"trust {candidate.get('trust_floor')} "
+              "(foreign results need independent reproduction)")
+        return
     # All certification and minting conditions live in eligibility.py (v0.1).
     verdict = eligibility.assess_transition(holder, candidate)
     if not verdict["certifiable"]:
@@ -1625,7 +1660,7 @@ def _chain_append(conn, entry_type: str, entry_id: str, body: str, rule: str,
     head_row = conn.execute(
         "SELECT chain_hash FROM chain ORDER BY seq DESC LIMIT 1").fetchone()
     prev = head_row["chain_hash"] if head_row else sha(CHAIN_GENESIS)
-    e_hash = journal_mod.entry_hash(rule, entry_type, body)
+    e_hash = journal_mod.entry_hash(rule, entry_type, body, entry_id)
     head = sha(prev + e_hash)
     conn.execute(
         "INSERT INTO chain(entry_id, entry_hash, prev_chain, chain_hash, "
@@ -1769,30 +1804,80 @@ def cmd_chain_verify():
     return ok
 
 
+def _published_heads():
+    """Heads that reached the public remote. A head committed only locally
+    proves nothing: whoever can rewrite the ledger can also write a commit."""
+    try:
+        log = subprocess.run(["git", "log", "origin/main", "--format=%B"],
+                             capture_output=True, text=True, cwd=BASE).stdout
+        return set(re.findall(r"\b[0-9a-f]{64}\b", log))
+    except OSError:
+        return set()
+
+
+def _local_only_heads():
+    try:
+        log = subprocess.run(["git", "log", "--all", "--format=%B"],
+                             capture_output=True, text=True, cwd=BASE).stdout
+        return set(re.findall(r"\b[0-9a-f]{64}\b", log)) - _published_heads()
+    except OSError:
+        return set()
+
+
+def detect_rollback(conn):
+    """A truncated ledger looks healthy if you only ask 'is my head anchored?'
+    — rolling back to an older anchor answers yes. So ask the other question:
+    is every head we ever published still present in this chain?"""
+    present = {row["chain_hash"] for row in
+               conn.execute("SELECT chain_hash FROM chain")}
+    published = _published_heads()
+    known = {row["chain_head"] for row in
+             conn.execute("SELECT chain_head FROM checkpoints")}
+    vanished = [h for h in (published | known) if h not in present
+                and _looks_like_our_head(conn, h)]
+    return vanished
+
+
+def _looks_like_our_head(conn, h: str) -> bool:
+    """Only count a hash as ours if we ever signed it as a checkpoint, or it
+    is recorded in the chain — otherwise any 64-hex string in a commit
+    message would raise a false alarm."""
+    row = conn.execute("SELECT 1 FROM checkpoints WHERE chain_head=?",
+                       (h,)).fetchone()
+    return row is not None
+
+
 def cmd_chain_status():
     """Entries past the last anchored head are still rewritable locally."""
     conn = db()
     total = conn.execute("SELECT COALESCE(MAX(seq),0) m FROM chain"
                          ).fetchone()["m"]
+    published = _published_heads()
+    local_only = _local_only_heads()
     anchored = 0
-    try:
-        log = subprocess.run(["git", "log", "--all", "--format=%B"],
-                             capture_output=True, text=True, cwd=BASE).stdout
-        heads = set(re.findall(r"\b[0-9a-f]{64}\b", log))
-        for row in conn.execute("SELECT seq, chain_hash FROM chain "
-                                "ORDER BY seq DESC"):
-            if row["chain_hash"] in heads:
-                anchored = row["seq"]
-                break
-    except OSError:
-        pass
+    for row in conn.execute("SELECT seq, chain_hash FROM chain ORDER BY seq DESC"):
+        if row["chain_hash"] in published:
+            anchored = row["seq"]
+            break
+    vanished = detect_rollback(conn)
     print(f"journal length : {total}")
-    print(f"anchored to seq: {anchored} (found in this repository's commits)")
+    print(f"anchored to seq: {anchored} (published to the public remote)")
     print(f"UNPROTECTED    : {total - anchored} entries")
     print(f"current rule   : {_next_rule(conn)}")
+    if vanished:
+        print()
+        print("  ROLLBACK DETECTED")
+        for h in vanished:
+            print(f"    a head we signed is gone from this chain: {h[:16]}…")
+        print("  the ledger has been truncated or rewritten below a point it "
+              "already vouched for")
+    if local_only:
+        print(f"note: {len(local_only)} head(s) appear only in unpushed "
+              "commits — they protect nothing until published")
     if total - anchored:
         print("these entries are rewritable by whoever holds the local ledger "
               "— anchor the head to fix them")
+    return not vanished
 
 
 def _register_node(conn, pubkey: str, label: str = ""):
@@ -2132,7 +2217,7 @@ def main():
     elif a.cmd == "chain" and a.action == "migrate":
         cmd_chain_migrate()
     elif a.cmd == "chain" and a.action == "status":
-        cmd_chain_status()
+        sys.exit(0 if cmd_chain_status() else 1)
     elif a.cmd == "identity":
         cmd_identity(a.action)
     elif a.cmd == "import-verification":

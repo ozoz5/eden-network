@@ -269,7 +269,23 @@ class TestFrontierAdmission(unittest.TestCase):
         self._store("ext-c", 3.0, "SIGNED", signed=True)
         self.assertEqual(self._energies(), [3.0])
 
-    def test_record_requires_reproduction_for_foreign_results(self):
-        self.assertTrue(self.eden.admits_to_record("VERIFIED"))
-        self.assertFalse(self.eden.admits_to_record("UNSIGNED"))
-        self.assertFalse(self.eden.admits_to_record("INVALID"))
+    def test_foreign_result_needs_reproduction_to_hold_a_record(self):
+        """A foreign signature says who claimed it, not that the work
+        happened — only reproduction on other hardware earns the record."""
+        self.assertTrue(self.eden.admits_to_record("VERIFIED", True))
+        self.assertFalse(self.eden.admits_to_record("SIGNED", True))
+        self.assertFalse(self.eden.admits_to_record("UNSIGNED", True))
+        self.assertFalse(self.eden.admits_to_record("INVALID", True))
+
+    def test_local_result_may_hold_a_record_unsigned(self):
+        """This ledger's own pipeline is allowed to be honest about being
+        a single node; it is not allowed to pretend about foreign work."""
+        self.assertTrue(self.eden.admits_to_record("LOCAL", False))
+        self.assertTrue(self.eden.admits_to_record("SIGNED", False))
+        self.assertFalse(self.eden.admits_to_record("INVALID", False))
+
+    def test_group_carries_its_weakest_trust(self):
+        self._store("run-a", 5.0, "SIGNED", signed=True)
+        groups = self.eden.group_stats(self.conn, "fam")
+        self.assertEqual(groups[0]["trust_floor"], "SIGNED")
+        self.assertFalse(groups[0]["is_foreign"])

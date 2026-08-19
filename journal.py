@@ -14,12 +14,13 @@ import hashlib
 
 LEGACY_RULE = "v1-legacy"
 DOMAIN_RULE = "v2-domain"
+BOUND_RULE = "v3-bound-id"
 
 # A verifier accepts only the rules it implements. The journal records that a
 # rule change happened; it does not have the authority to legitimise any rule
 # a writer invents (audit 5).
-SUPPORTED_RULES = (LEGACY_RULE, DOMAIN_RULE)
-RULE_STRENGTH = {LEGACY_RULE: 1, DOMAIN_RULE: 2}
+SUPPORTED_RULES = (LEGACY_RULE, DOMAIN_RULE, BOUND_RULE)
+RULE_STRENGTH = {LEGACY_RULE: 1, DOMAIN_RULE: 2, BOUND_RULE: 3}
 
 
 def _sha(data) -> str:
@@ -28,7 +29,8 @@ def _sha(data) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def entry_hash(rule: str, entry_type: str, canonical_bytes: str) -> str:
+def entry_hash(rule: str, entry_type: str, canonical_bytes: str,
+               entry_id: str = "") -> str:
     """v1-legacy: 16 hex of SHA-256(body), no domain — the rule the first 147
     entries were written under, defined here so they hash identically.
     v2-domain: full SHA-256 over a type-qualified preimage, so two entries of
@@ -37,6 +39,12 @@ def entry_hash(rule: str, entry_type: str, canonical_bytes: str) -> str:
         return _sha(canonical_bytes)[:16]
     if rule == DOMAIN_RULE:
         return _sha("EDEN:" + entry_type + ":v1|" + canonical_bytes)
+    if rule == BOUND_RULE:
+        # The id is part of what is committed to: anything that later points
+        # at an entry by id (a revocation, a verification) must not be able to
+        # find the same hash under a different id.
+        return _sha("EDEN:" + entry_type + ":v3|" + entry_id + "|"
+                    + canonical_bytes)
     raise ValueError(f"unsupported hash rule: {rule}")
 
 

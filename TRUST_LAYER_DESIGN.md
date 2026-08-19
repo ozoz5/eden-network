@@ -553,3 +553,65 @@ Phase A/Bで trust_state は計算できるようになったが、**前線判�
 **正直な現状**: 今の台帳では結果が変わらない（外来6件はすべてUNSIGNEDで、
 以前の `ext-` 文字列除外と同じ結果になる）。差が出るのは署名付きの外来レシートが
 到着したときで、規則はその日のために先に置かれている。
+
+
+---
+
+## 15. Rollback / freshness / record admission（第7次監査、2026-08-19）
+
+### 15.1 巻き戻し攻撃は成立していた（実測）
+
+`chain status` は「自分のheadがanchorされているか」だけを問うていた。
+だから**過去のanchor地点ちょうどへ切り詰めると、健全に見える**:
+
+```text
+攻撃前: 150 entries / anchored 150 / UNPROTECTED 0
+攻撃  : DELETE FROM chain WHERE seq > 148   （SIGNEDとVERIFIEDの記録を消す）
+攻撃後: 148 entries / anchored 148 / UNPROTECTED 0 / verdict INTACT  ← 気づけない
+```
+
+**修正 — 問いを逆にする**: 「自分のheadは守られているか」ではなく
+**「かつて公表した全headが、今もこのchainに在るか」**を問う。
+`detect_rollback()` は checkpoint署名したheadを台帳から探し、消えていれば名指しで報告する。
+誤検出を避けるため、判定材料は**自分がcheckpointとして署名したhead**に限る
+（commit本文中の任意の64hex文字列を根拠にしない）。
+
+実測（攻撃を台帳のコピーで再現、本番は無傷）:
+```text
+ROLLBACK DETECTED
+  a head we signed is gone from this chain: 6b6ba8f382fa6a03…
+  a head we signed is gone from this chain: 3a2b72ad2aa5ca92…
+```
+
+### 15.2 anchorは「公開済み」でなければ意味がない
+
+`git log --all` はローカルcommitを含む。台帳を書き換えられる者は、
+**都合の良いheadを書いたcommitをローカルに作れる**。
+anchorの判定を `git log origin/main` に限定し、未pushのheadは
+「まだ何も守っていない」と明示表示する。
+
+### 15.3 record admission が実経路に無かった
+
+`admits_to_record()` は定義されていたが**呼び出し0件**で、しかも
+`is_foreign` を見ずSIGNEDでも真を返していた — コメントの主張と実装の乖離。
+
+修正:
+```text
+admits_to_record(state, is_foreign):
+  foreign → VERIFIED のみ（他ハードで再現された結果だけが記録を持てる）
+  local   → LOCAL / SIGNED / VERIFIED
+```
+`group_stats` が各グループへ `trust_floor`（**構成レシートの最弱**）と
+`is_foreign` を付与し、FIRST RECORDと前線更新の**両方の実経路**でこのゲートを通す。
+
+### 15.4 entry_id を hash preimage へ束縛（v3-bound-id）
+
+失効や検証はentryを**idで指す**。idがpreimageの外にあると、
+同一bodyの別idエントリが同じhashを持つ。規則v3で束縛:
+
+```text
+entry_hash = SHA256("EDEN:" + type + ":v3|" + entry_id + "|" + canonical_body)
+```
+
+既存chainは触らない（v1/v2のまま）。移行は `rule_change` として刻む —
+規則の版管理（§10）がそのまま使える。
