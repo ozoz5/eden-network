@@ -1333,28 +1333,50 @@ def cmd_challenge_open(gen_spec_path: str, runners: list, n: int):
     # epoch. Phase A: persist the stub and enrollments, COMMIT. An epoch
     # abandoned after this point stays visible as a PENDING stub: grinding
     # now leaves ledger traces instead of vanishing.
+    # Phase A: name a round that has not happened yet, then make the whole
+    # promise durable. Fetching randomness that already exists would let the
+    # operator look first and abandon epochs it dislikes; a future round has
+    # nothing to look at (audit 5).
+    promise = challenge_mod.promise_future_round()
+    if promise:
+        target_round, expected_at, chain_hash = promise
+        rand_source = f"drand:{chain_hash[:16]}:round-{target_round}"
+    else:
+        target_round, expected_at, rand_source = None, None, None
     commitment = sha(fam + str(epoch_no)
-                     + "|".join(h for _, h in sorted(enrollment)))[:32]
+                     + "|".join(h for _, h in sorted(enrollment))
+                     + f"|drand-round:{target_round}")[:32]
     epoch_id = sha(fam + str(epoch_no) + commitment)[:16]
     conn.execute("INSERT INTO epochs(epoch_id, family_id, epoch_no, seed, "
-                 "n_instances, gen_spec_json, created_at, commitment_hash) "
-                 "VALUES (?,?,?,?,?,?,?,?)",
+                 "n_instances, gen_spec_json, created_at, commitment_hash, "
+                 "randomness_source) VALUES (?,?,?,?,?,?,?,?,?)",
                  (epoch_id, fam, epoch_no, "PENDING", n, canonical(spec),
-                  now_iso(), commitment))
+                  now_iso(), commitment, rand_source or "pending"))
     for runner, code_hash in enrollment:
         conn.execute("INSERT INTO enrollments VALUES (?,?,?,?)",
                      (epoch_id, runner, code_hash, now_iso()))
     conn.commit()
 
-    # Phase B: only now fetch randomness that postdates the durable commit.
-    rand_source, rand_value = challenge_mod.fetch_external_randomness()
+    # Phase B: wait for the promised round to exist, then open it. Nobody —
+    # including this node — could read it before this moment.
+    rand_value = None
+    if target_round is not None:
+        wait = max(0.0, expected_at - time.time()) + 2.0
+        if wait > 0:
+            print(f"promised drand round {target_round}; waiting {wait:.0f}s "
+                  "for it to exist")
+            time.sleep(wait)
+        rand_value = challenge_mod.open_promised_round(target_round)
+    if rand_value is None:
+        rand_source, rand_value = challenge_mod.fetch_external_randomness()
+        rand_source += " (promised round unavailable — fallback)"
     seed = challenge_mod.derive_epoch_seed_v2(fam, epoch_no, commitment,
                                               rand_value)
     conn.execute("UPDATE epochs SET seed=?, randomness_source=?, "
                  "randomness_value=? WHERE epoch_id=?",
                  (seed, rand_source, rand_value, epoch_id))
     conn.commit()
-    print(f"randomness: {rand_source} (fetched after durable commitment)")
+    print(f"randomness: {rand_source}")
 
     correct = (BASE / spec["correct_source"]).read_text()
     test_path = BASE / spec["test_file"]

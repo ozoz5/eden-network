@@ -118,3 +118,50 @@ class TestEnrollment(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPromisedRandomness(unittest.TestCase):
+    """Naming a round before it exists is what removes the operator's choice.
+
+    These tests reach the public beacon; when it is unreachable they skip
+    rather than pretend to have verified something.
+    """
+
+    def _promise(self):
+        p = challenge.promise_future_round()
+        if p is None:
+            self.skipTest("drand unreachable")
+        return p
+
+    def test_promised_round_is_in_the_future(self):
+        import time
+        target, when, chain_hash = self._promise()
+        self.assertGreater(when, time.time())
+        self.assertTrue(chain_hash)
+
+    def test_a_promised_round_cannot_be_opened_early(self):
+        """The whole point: there is nothing to peek at."""
+        target, _, _ = self._promise()
+        self.assertIsNone(challenge.open_promised_round(target, attempts=1))
+
+    def test_a_past_round_opens_and_is_the_same_for_everyone(self):
+        target, _, _ = self._promise()
+        past = target - 20
+        first = challenge.open_promised_round(past, attempts=2)
+        if first is None:
+            self.skipTest("drand unreachable")
+        self.assertEqual(first, challenge.open_promised_round(past, attempts=2))
+        self.assertTrue(first.startswith(f"round:{past}:"))
+
+    def test_seed_is_reproducible_from_public_inputs(self):
+        """Anyone holding the ledger's commitment can re-derive the seed from
+        the beacon — the epoch's fairness is checkable without trusting us."""
+        target, _, _ = self._promise()
+        value = challenge.open_promised_round(target - 20, attempts=2)
+        if value is None:
+            self.skipTest("drand unreachable")
+        a = challenge.derive_epoch_seed_v2("fam", 3, "commit", value)
+        b = challenge.derive_epoch_seed_v2("fam", 3, "commit", value)
+        self.assertEqual(a, b)
+        self.assertNotEqual(
+            a, challenge.derive_epoch_seed_v2("fam", 3, "other", value))

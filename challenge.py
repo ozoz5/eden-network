@@ -66,6 +66,59 @@ def derive_epoch_seed_v2(family_id: str, epoch_no: int,
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
+DRAND_BASE = "https://drand.cloudflare.com"
+DRAND_LEAD_ROUNDS = 4      # ~2 minutes at a 30s period
+
+
+def _drand_get(path: str, timeout: int = 8):
+    import json as _json
+    import urllib.request
+    req = urllib.request.Request(DRAND_BASE + path,
+                                 headers={"User-Agent": "eden/0.5"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return _json.loads(r.read().decode())
+
+
+def promise_future_round(lead: int = DRAND_LEAD_ROUNDS):
+    """Name a round that has not happened yet.
+
+    The point is what cannot be done: a round in the future has no value to
+    look at, so an operator cannot peek at the randomness, dislike it, and
+    quietly re-open the epoch. Committing to the round number is a promise
+    made before the answer exists.
+
+    Returns (round_number, expected_unix_time, chain_hash) or None offline.
+    """
+    try:
+        info = _drand_get("/info")
+        latest = _drand_get("/public/latest")
+    except Exception:
+        return None
+    target = latest["round"] + max(1, lead)
+    # Measured against the live beacon: round r lands at genesis + r*period.
+    # Being one period out silently cost an epoch its promised randomness.
+    when = info["genesis_time"] + target * info["period"]
+    return target, when, info["hash"]
+
+
+def open_promised_round(round_number: int, attempts: int = 6,
+                        gap_seconds: float = 10.0):
+    """Read the round once it exists. Before its time it returns 404 — the
+    promise cannot be opened early, by us or by anyone.
+
+    Publication can lag its scheduled time, so this retries rather than
+    falling back to weaker randomness the moment the network is slow."""
+    import time as _time
+    for attempt in range(attempts):
+        try:
+            beacon = _drand_get(f"/public/{round_number}")
+            return f"round:{beacon['round']}:{beacon['signature']}"
+        except Exception:
+            if attempt + 1 < attempts:
+                _time.sleep(gap_seconds)
+    return None
+
+
 def fetch_external_randomness(timeout: int = 6):
     """drand (Cloudflare mirror) -> NIST beacon -> operator-local fallback.
 
