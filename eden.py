@@ -38,6 +38,7 @@ from pathlib import Path
 
 import challenge as challenge_mod
 import eligibility
+import identity as identity_mod
 import journal as journal_mod
 import ore as ore_mod
 
@@ -63,7 +64,11 @@ def now_iso() -> str:
 
 
 def canonical(obj) -> str:
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+    """The signing preimage (TRUST_LAYER_DESIGN.md §2). allow_nan=False keeps
+    Infinity/NaN out: Python emits them, RFC 8259 forbids them, and a
+    signature no other language can re-verify is not a signature."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True, allow_nan=False)
 
 
 # ---------------------------------------------------------------- measurement
@@ -472,6 +477,19 @@ CREATE TABLE IF NOT EXISTS chain(
   hash_rule TEXT,
   entry_body TEXT
 );
+CREATE TABLE IF NOT EXISTS nodes(
+  node_id TEXT PRIMARY KEY,
+  public_key TEXT NOT NULL,
+  label TEXT,
+  registered_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS checkpoints(
+  chain_head TEXT PRIMARY KEY,
+  seq INTEGER NOT NULL,
+  node_id TEXT NOT NULL,
+  signature TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS ores(
   ore_hash TEXT PRIMARY KEY,
   receipt_id TEXT NOT NULL,
@@ -520,6 +538,11 @@ def db() -> sqlite3.Connection:
     for old, new in (("receipt_id", "entry_id"), ("receipt_hash", "entry_hash")):
         try:
             conn.execute(f"ALTER TABLE chain RENAME COLUMN {old} TO {new}")
+        except sqlite3.OperationalError:
+            pass
+    for col in ("trust_state",):
+        try:
+            conn.execute(f"ALTER TABLE receipts ADD COLUMN {col} TEXT")
         except sqlite3.OperationalError:
             pass
     for col in ("entry_type", "hash_rule", "entry_body"):
@@ -810,13 +833,35 @@ def build_receipt(conn, run_id: str):
             "machine": platform.machine(),
         },
         "timestamp": row["completed_at"],
-        "signatures": [],
     }
+    # Signed over the body WITHOUT this field, so verification can reproduce
+    # the preimage by removing it again.
+    receipt["signatures"] = _sign_receipt_body(receipt)
     # §2.1 invariant: economic interpretation must never enter a receipt.
     # Audit fix: raise (assert vanishes under -O) and match KEY NAMES exactly
     # (substring matching crashed on legitimate values like runner_id="baseline").
     _check_forbidden(receipt)
     return receipt
+
+
+def _sign_receipt_body(body: dict) -> list:
+    """Sign the receipt minus its own signatures (TRUST_LAYER_DESIGN.md §2).
+
+    A missing key is not an error: measurement exists before trust does, and
+    the receipt simply stays UNSIGNED rather than not existing."""
+    try:
+        pub = identity_mod.public_key()
+        sig = identity_mod.sign(canonical(body), identity_mod.NS_RECEIPT)
+    except (identity_mod.SigningUnavailable, OSError):
+        return []
+    return [{
+        "role": "runner+meter+verifier",
+        "role_collapse": True,   # one node, one key: a collapse, not a merger
+        "node_id": identity_mod.node_id_of(pub),
+        "alg": "sshsig-ed25519",
+        "namespace": identity_mod.NS_RECEIPT,
+        "signature": sig,
+    }]
 
 
 def _check_forbidden(obj, path="receipt"):
@@ -845,8 +890,11 @@ def cmd_receipt_emit(run_id_prefix: str, conn=None, quiet=False):
     rj = canonical(receipt)
     rhash = sha(rj)[:16]
     conn.execute(
-        "INSERT OR IGNORE INTO receipts VALUES (?,?,?,?,?,?)",
-        (rhash, run["run_id"], receipt["family_id"], rj, rhash, now_iso()),
+        "INSERT OR IGNORE INTO receipts(receipt_id, run_id, family_id, "
+        "receipt_json, receipt_hash, created_at, trust_state) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (rhash, run["run_id"], receipt["family_id"], rj, rhash, now_iso(),
+         "SIGNED" if receipt.get("signatures") else "LOCAL"),
     )
     conn.commit()
     if not quiet:
@@ -872,8 +920,11 @@ def cmd_import(path: str):
         rj = canonical(rec)
         rhash = sha(rj)[:16]
         cur = conn.execute(
-            "INSERT OR IGNORE INTO receipts VALUES (?,?,?,?,?,?)",
-            (rhash, "ext-" + rhash, rec["family_id"], rj, rhash, now_iso()),
+            "INSERT OR IGNORE INTO receipts(receipt_id, run_id, family_id, "
+            "receipt_json, receipt_hash, created_at, trust_state) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (rhash, "ext-" + rhash, rec["family_id"], rj, rhash, now_iso(),
+             "UNSIGNED"),
         )
         added += cur.rowcount
     conn.commit()
@@ -1699,6 +1750,98 @@ def cmd_chain_status():
               "— anchor the head to fix them")
 
 
+def _register_node(conn, pubkey: str, label: str = ""):
+    nid = identity_mod.node_id_of(pubkey)
+    conn.execute("INSERT OR IGNORE INTO nodes VALUES (?,?,?,?)",
+                 (nid, pubkey, label, now_iso()))
+    conn.commit()
+    return nid
+
+
+def cmd_identity(action: str):
+    if action == "init":
+        if identity_mod.have_key():
+            print(f"key already exists: {identity_mod.KEY_PATH}")
+        else:
+            identity_mod.create_key()
+            print(f"created: {identity_mod.KEY_PATH} (mode 0600)")
+    try:
+        pub = identity_mod.public_key()
+    except identity_mod.SigningUnavailable as e:
+        print(f"no identity: {e}")
+        print("receipts will be emitted UNSIGNED (measurement precedes trust)")
+        return
+    nid = _register_node(db(), pub, "local")
+    print(f"node_id : {nid}")
+    print(f"display : {nid[:12]}…")
+    print(f"pubkey  : {pub[:60]}…")
+
+
+def trust_state_of(conn, receipt: dict, run_id: str) -> str:
+    """What this ledger is entitled to claim about a receipt.
+
+    SIGNED means someone put their name on it — not that it is true. The
+    tiers above exist because signatures cannot close that gap."""
+    sigs = receipt.get("signatures") or []
+    if not sigs:
+        return "UNSIGNED" if run_id.startswith("ext-") else "LOCAL"
+    body = {k: v for k, v in receipt.items() if k != "signatures"}
+    for sig in sigs:
+        row = conn.execute("SELECT public_key FROM nodes WHERE node_id=?",
+                           (sig.get("node_id"),)).fetchone()
+        if row is None:
+            continue
+        if identity_mod.verify(canonical(body), sig.get("signature", ""),
+                               sig.get("namespace", ""), row["public_key"]):
+            return "SIGNED"
+    return "UNSIGNED" if run_id.startswith("ext-") else "LOCAL"
+
+
+def cmd_verify_signatures():
+    """Re-verify every signature in the ledger against the registered keys."""
+    conn = db()
+    counts = {}
+    bad = 0
+    for row in conn.execute("SELECT receipt_id, run_id, receipt_json "
+                            "FROM receipts ORDER BY created_at"):
+        rec = json.loads(row["receipt_json"])
+        state = trust_state_of(conn, rec, row["run_id"])
+        if rec.get("signatures") and state != "SIGNED":
+            print(f"  {row['receipt_id']}: signature present but INVALID")
+            bad += 1
+        counts[state] = counts.get(state, 0) + 1
+        conn.execute("UPDATE receipts SET trust_state=? WHERE receipt_id=?",
+                     (state, row["receipt_id"]))
+    conn.commit()
+    for state in ("LOCAL", "UNSIGNED", "SIGNED", "ATTESTED", "VERIFIED"):
+        if counts.get(state):
+            print(f"  {state:<9}: {counts[state]}")
+    print(f"invalid signatures: {bad}")
+    return bad == 0
+
+
+def cmd_chain_checkpoint():
+    """Sign the current head, so the anchor says who vouched for it."""
+    conn = db()
+    row = conn.execute(
+        "SELECT seq, chain_hash FROM chain ORDER BY seq DESC LIMIT 1").fetchone()
+    if row is None:
+        sys.exit("error: journal is empty")
+    try:
+        pub = identity_mod.public_key()
+        body = canonical({"chain_head": row["chain_hash"], "seq": row["seq"]})
+        sig = identity_mod.sign(body, identity_mod.NS_CHECKPOINT)
+    except identity_mod.SigningUnavailable as e:
+        sys.exit(f"error: cannot sign checkpoint ({e}) — run: eden identity init")
+    nid = _register_node(conn, pub, "local")
+    conn.execute("INSERT OR REPLACE INTO checkpoints VALUES (?,?,?,?,?)",
+                 (row["chain_hash"], row["seq"], nid, sig, now_iso()))
+    conn.commit()
+    print(f"checkpoint signed by {nid[:12]}… at seq {row['seq']}")
+    print(f"head: {row['chain_hash']}")
+    print("anchor it now: put this head in the next commit message")
+
+
 def cmd_ore_scan():
     """Seal receipts with the first epoch opened after them; keep the rare.
 
@@ -1788,7 +1931,13 @@ def main():
 
     pchn = sub.add_parser("chain", help="tamper-evident journal")
     pchn.add_argument("action",
-                      choices=["build", "verify", "migrate", "status"])
+                      choices=["build", "verify", "migrate", "status",
+                               "checkpoint"])
+
+    pid = sub.add_parser("identity", help="node key and id")
+    pid.add_argument("action", choices=["init", "show"])
+
+    sub.add_parser("verify-signatures", help="re-verify all ledger signatures")
 
     por = sub.add_parser("ore", help="the cultural layer (v1 spec 13)")
     por.add_argument("action", choices=["scan", "list"])
@@ -1860,6 +2009,12 @@ def main():
         cmd_chain_migrate()
     elif a.cmd == "chain" and a.action == "status":
         cmd_chain_status()
+    elif a.cmd == "identity":
+        cmd_identity(a.action)
+    elif a.cmd == "verify-signatures":
+        sys.exit(0 if cmd_verify_signatures() else 1)
+    elif a.cmd == "chain" and a.action == "checkpoint":
+        cmd_chain_checkpoint()
     elif a.cmd == "ore" and a.action == "scan":
         cmd_ore_scan()
     elif a.cmd == "ore" and a.action == "list":

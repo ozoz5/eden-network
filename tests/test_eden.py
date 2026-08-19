@@ -38,7 +38,8 @@ class TempLedger:
 
 def _insert(conn, fam, rows):
     for i, r in enumerate(rows):
-        conn.execute("INSERT INTO receipts VALUES (?,?,?,?,?,?)",
+        conn.execute("INSERT INTO receipts(receipt_id, run_id, family_id, "
+                     "receipt_json, receipt_hash, created_at) VALUES (?,?,?,?,?,?)",
                      (f"r{fam}{i}", f"run{fam}{i}", fam, r, f"r{fam}{i}", "t"))
     conn.commit()
 

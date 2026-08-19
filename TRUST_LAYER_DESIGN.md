@@ -1,6 +1,6 @@
 # EDEN Trust Layer 設計書（草案）
 
-状態: **設計草案 — 実装禁止。実装前に敵対監査を通過すること**（追補13の宣言による）
+状態: **Phase A 実装済み（2026-08-19）**。Phase B（WITNESS再検証→VERIFIED）/ C（attestation）は未着手
 日付: 2026-08-18
 対象: 第3次監査の未解決1〜3（Node/Receipt署名、Meter attestation、Verifier独立性）
 
@@ -392,3 +392,32 @@ body = {from_seq: 148, field: "entry_hash", old_rule: "v1-legacy",
 
 **1〜4を署名より先に済ませる。** 署名entryが v1-legacy 規則で刻まれてしまうと、
 以後ずっと2規則が混在したままになる。
+
+
+---
+
+## 11. Phase A 実装記録（2026-08-19）
+
+`identity.py`（sshsig呼び出しの隔離層）+ eden.py接続。実装したもの:
+
+- `eden identity init/show` — 鍵生成（0600）、node_id全64hex、nodesテーブルへ登録
+- レシート発行時の自動署名（namespace `eden-receipt`、signaturesを除いた本体が対象）
+- `eden verify-signatures` — 台帳全件の署名再検証とtrust_state分類
+- `eden chain checkpoint` — headへ署名（namespace `eden-checkpoint`）
+- CANONICAL RULE（§2）をcanonical()へ適用（allow_nan=False。既存hashへの影響なしを実測確認）
+
+**実測した拒否（テスト8本で固定）:** 改竄payload / namespace転用 / 別鍵での偽装 /
+不正base64 — すべて拒否。鍵不在は例外ではなくUNSIGNEDとして扱う（測定は信頼に先行する）。
+
+**実装中に見つけた欠陥（実台帳で走らせなければ埋もれていた）:**
+`receipts` へ `trust_state` 列を足した結果、暗黙の `INSERT ... VALUES (?,?,?,?,?,?)` が
+列数不一致で失敗し、**レシート発行が静かに落ちていた**。CLIはエラーを表示せず、
+台帳の件数が増えないことでしか気づけなかった。全INSERTを列明示へ変更。
+教訓: スキーマを足したら、暗黙の列順に依存する書き込みを全数洗う。
+
+**現在の台帳:** 149 entries / INTACT / LOCAL 141・UNSIGNED 6・**SIGNED 1**（史上初）/
+checkpoint署名済み head `6b6ba8f382fa6a03b14b647a6f99f291e7ededc386226d8396ea29e0f9b380e4`
+
+**Phase Aで到達していないもの（正直に）:** SIGNEDは「誰が言ったか」しか固定しない。
+ATTESTED（計測根拠）とVERIFIED（他ノードの再検証）は未実装であり、
+現在の1件は単一ノードの自己署名 — role_collapse=true をレシート自身が申告している。

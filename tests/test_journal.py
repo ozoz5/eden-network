@@ -107,7 +107,8 @@ class TestJournalMigration(unittest.TestCase):
         for i in range(6):
             rj = json.dumps({"n": i}, sort_keys=True, separators=(",", ":"))
             h = eden.sha(rj)[:16]
-            self.conn.execute("INSERT INTO receipts VALUES (?,?,?,?,?,?)",
+            self.conn.execute("INSERT INTO receipts(receipt_id, run_id, family_id, "
+                     "receipt_json, receipt_hash, created_at) VALUES (?,?,?,?,?,?)",
                               (h, f"run{i}", "fam", rj, h,
                                f"2026-08-19T00:00:{i:02d}+00:00"))
         self.conn.commit()
@@ -145,7 +146,8 @@ class TestJournalMigration(unittest.TestCase):
         self._run(eden.cmd_chain_migrate)
         rj = json.dumps({"n": 99}, sort_keys=True, separators=(",", ":"))
         h = eden.sha(rj)[:16]
-        self.conn.execute("INSERT INTO receipts VALUES (?,?,?,?,?,?)",
+        self.conn.execute("INSERT INTO receipts(receipt_id, run_id, family_id, "
+                     "receipt_json, receipt_hash, created_at) VALUES (?,?,?,?,?,?)",
                           (h, "run99", "fam", rj, h,
                            "2026-08-19T01:00:00+00:00"))
         self.conn.commit()

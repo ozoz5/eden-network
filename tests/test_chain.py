@@ -34,7 +34,8 @@ def _insert_receipts(conn, n):
     for i in range(n):
         rj = _receipt(i)
         rhash = eden.sha(rj)[:16]
-        conn.execute("INSERT INTO receipts VALUES (?,?,?,?,?,?)",
+        conn.execute("INSERT INTO receipts(receipt_id, run_id, family_id, "
+                     "receipt_json, receipt_hash, created_at) VALUES (?,?,?,?,?,?)",
                      (rhash, f"run{i}", "fam", rj, rhash,
                       f"2026-08-18T00:00:{i:02d}+00:00"))
     conn.commit()
