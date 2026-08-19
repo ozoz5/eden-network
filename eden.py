@@ -1528,10 +1528,25 @@ def cmd_challenge_certify(epoch_prefix: str, commit: bool = False):
         (fam,))]
     print(f"epoch {eid}  family={fam}  certifying {len(aggs)} runner strata")
     for a in aggs:
+        # Per-run observations, so the certificate carries a resampled
+        # interval rather than a point estimate with a flat margin.
+        obs = [(row["energy_joules"] + (row["verify_j"] or 0.0),
+                row["status"] == "PASS")
+               for row in conn.execute(
+                   """SELECT m.energy_joules,
+                             COALESCE(v.verify_energy_joules,0) AS verify_j,
+                             COALESCE(v.status,'FAIL') AS status
+                      FROM epoch_runs er
+                      JOIN runs r ON r.run_id = er.run_id
+                      JOIN measurements m ON m.run_id = er.run_id
+                      LEFT JOIN verifications v ON v.run_id = er.run_id
+                      WHERE er.epoch_id=? AND er.runner_id=?
+                        AND r.runner_code_hash=?""",
+                   (eid, a["runner_id"], a["runner_code_hash"]))]
         cert = eligibility.distribution_cert(
             eid, fam, a["runner_id"], a["runner_code_hash"], a["meter"],
             epoch["n_instances"], a["attempts"], a["successes"] or 0,
-            a["run_j"], a["verify_j"])
+            a["run_j"], a["verify_j"], observations=obs)
         verdict = eligibility.assess_cert_insertion(existing, cert)
         # AUDIT H5: a certificate must prove it faced every issued instance
         # with the exact code it committed at enrollment.
@@ -1557,6 +1572,10 @@ def cmd_challenge_certify(epoch_prefix: str, commit: bool = False):
               f"{cert['rate_ci95'][1]*100:.0f}%])  "
               f"total {cert['total_j']:.3f} J (verify incl.)  "
               f"J/success {jps}")
+        jci = cert.get("jps_ci95") or [None, None]
+        if jci[0] is not None:
+            hi = "inf" if jci[1] == float("inf") else f"{jci[1]:.2f}"
+            print(f"    J/success ci95 (bootstrap): [{jci[0]:.2f}, {hi}]")
         if not verdict["eligible"]:
             print("    NOT ELIGIBLE: " + "; ".join(verdict["reasons"]))
             continue

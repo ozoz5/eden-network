@@ -100,6 +100,12 @@ def assess_record(group) -> dict:
 MIN_INSTANCES = 5   # distribution certificates need a minimal epoch size
 Z_95 = 1.96
 
+JPS_MARGIN = 0.2   # fallback only: used when a certificate predates
+                   # per-observation data and carries no bootstrap interval
+BOOTSTRAP_ROUNDS = 2000
+BOOTSTRAP_SEED = 20260819   # fixed: the same evidence must yield the same
+                            # interval on every machine that re-checks it
+
 
 def wilson_interval(successes: int, attempts: int, z: float = Z_95):
     """95% interval for a success rate; honest about small n."""
@@ -113,8 +119,39 @@ def wilson_interval(successes: int, attempts: int, z: float = Z_95):
     return (max(0.0, center - half), min(1.0, center + half))
 
 
+def bootstrap_jps(observations, rounds: int = BOOTSTRAP_ROUNDS):
+    """A confidence interval for joules-per-success, resampled from the runs
+    themselves rather than assumed.
+
+    J/success is a ratio of two quantities that both move: the energy spent
+    and how many attempts happened to succeed. Resampling the attempts keeps
+    those two tied together, which a margin on the point estimate cannot do.
+    A resample where nothing succeeds has no finite ratio, and is carried as
+    infinity rather than dropped — discarding it would quietly flatter a
+    runner that only sometimes succeeds.
+
+    observations: [(energy_joules, succeeded_bool), ...]
+    """
+    import random
+    n = len(observations)
+    if n == 0:
+        return (0.0, float("inf"))
+    rng = random.Random(BOOTSTRAP_SEED)
+    ratios = []
+    for _ in range(rounds):
+        sample = [observations[rng.randrange(n)] for _ in range(n)]
+        wins = sum(1 for _, ok in sample if ok)
+        total = sum(e for e, _ in sample)
+        ratios.append(total / wins if wins else float("inf"))
+    ratios.sort()
+    lo = ratios[int(0.025 * (rounds - 1))]
+    hi = ratios[int(0.975 * (rounds - 1))]
+    return (lo, hi)
+
+
 def distribution_cert(epoch_id, family_id, runner, code_hash, meter,
-                      n_instances, attempts, successes, run_j, verify_j):
+                      n_instances, attempts, successes, run_j, verify_j,
+                      observations=None):
     """The frontier's input unit for challenge families (v0.3):
     not "solved one instance cheaply" but "processed the issued distribution
     at success rate q for X J per success". Verification energy is inside
@@ -123,6 +160,8 @@ def distribution_cert(epoch_id, family_id, runner, code_hash, meter,
     rate = successes / attempts if attempts else 0.0
     jps = (total / successes) if successes else float("inf")
     lo, hi = wilson_interval(successes, attempts)
+    jps_lo, jps_hi = (bootstrap_jps(observations) if observations
+                      else (None, None))
     return {
         "cert_id": f"{epoch_id[:8]}:{runner}#{code_hash[:6]}@{meter}",
         "epoch_id": epoch_id, "family_id": family_id,
@@ -132,6 +171,7 @@ def distribution_cert(epoch_id, family_id, runner, code_hash, meter,
         "rate_ci95": [lo, hi],
         "run_j": run_j, "verify_j": verify_j, "total_j": total,
         "j_per_success": jps,
+        "jps_ci95": [jps_lo, jps_hi],
     }
 
 
@@ -156,8 +196,6 @@ def dominates(a, b) -> bool:
     return ge and strict
 
 
-JPS_MARGIN = 0.2   # provisional J/success margin until per-cert energy
-                   # intervals exist (audit H4: energy has meter noise too)
 
 
 def certified_dominates(a, b) -> bool:
@@ -172,8 +210,18 @@ def certified_dominates(a, b) -> bool:
     if not (rate_ge and jps_le):
         return False
     rate_sep = a["rate_ci95"][0] >= b["rate_ci95"][1]
-    jps_sep = a["j_per_success"] <= b["j_per_success"] * (1 - JPS_MARGIN)
+    jps_sep = _jps_separated(a, b)
     return rate_sep or jps_sep
+
+
+def _jps_separated(a, b) -> bool:
+    """Separation on energy: the challenger's whole interval below the
+    holder's. Falls back to the flat margin only for certificates written
+    before per-observation data was kept."""
+    a_ci, b_ci = a.get("jps_ci95"), b.get("jps_ci95")
+    if a_ci and b_ci and a_ci[1] is not None and b_ci[0] is not None:
+        return a_ci[1] < b_ci[0]
+    return a["j_per_success"] <= b["j_per_success"] * (1 - JPS_MARGIN)
 
 
 def certification_basis(a, b) -> list:
@@ -182,8 +230,12 @@ def certification_basis(a, b) -> list:
     bases = []
     if a["rate_ci95"][0] >= b["rate_ci95"][1]:
         bases.append("success-rate-certified (Wilson CI separation)")
-    if a["j_per_success"] <= b["j_per_success"] * (1 - JPS_MARGIN):
-        bases.append("energy-margin-certified (protocol margin, not a CI)")
+    if _jps_separated(a, b):
+        a_ci, b_ci = a.get("jps_ci95"), b.get("jps_ci95")
+        if a_ci and b_ci and a_ci[1] is not None and b_ci[0] is not None:
+            bases.append("energy-certified (bootstrap CI separation)")
+        else:
+            bases.append("energy-margin-certified (protocol margin, not a CI)")
     return bases
 
 

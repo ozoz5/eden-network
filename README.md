@@ -179,6 +179,22 @@ and Pareto-dominates the 7b outright; and **retries buy nothing against
 systematic failures** — the 7b fails the same way every time, so three
 attempts cost 3× for the same 5/12.
 
+*Revised with bootstrap intervals (2026-08-19).* Resampling the runs
+instead of trusting point estimates sharpened which of these claims the
+evidence actually carries:
+
+```text
+cascade  1.37 J/success  ci95 [0.78, 2.07]  ⎫ overlapping — the evidence
+brute    1.53 J/success  ci95 [1.20, 1.87]  ⎭ does not separate these two
+1.5b       81 J/success  ci95 [54.7, 162.5] ⎫ disjoint — this domination
+7b        392 J/success  ci95 [213, 1060]   ⎭ is real
+```
+
+So "the cascade beat brute-force search" was over-read from twelve runs;
+"the small model beats its larger sibling per verified success" survives
+the resampling. Minting now requires the intervals to separate, which is
+why the first claim no longer earns anything.
+
 Declared bias, as always: the bug vocabulary is a subset of the searcher's
 mutation vocabulary, so the cascade resolved everything in its cheap stages
 (its LLM stages never fired). On a distribution that defeats search, these

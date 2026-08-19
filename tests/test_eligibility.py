@@ -159,3 +159,90 @@ class TestDistributionCerts(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBootstrapInterval(unittest.TestCase):
+    """J/success is a ratio whose numerator and denominator both move; the
+    interval has to come from the runs, not from a flat margin."""
+
+    STEADY = [(80.0, True), (75.0, True), (90.0, True), (85.0, True),
+              (70.0, True), (95.0, True), (60.0, False), (65.0, False),
+              (55.0, False), (70.0, False), (80.0, False), (75.0, False)]
+
+    def test_interval_brackets_the_point_estimate(self):
+        lo, hi = eligibility.bootstrap_jps(self.STEADY)
+        point = (sum(e for e, _ in self.STEADY)
+                 / sum(1 for _, ok in self.STEADY if ok))
+        self.assertLess(lo, point)
+        self.assertGreater(hi, point)
+
+    def test_same_evidence_gives_the_same_interval(self):
+        """Anyone re-checking the ledger must reach the identical interval."""
+        self.assertEqual(eligibility.bootstrap_jps(self.STEADY),
+                         eligibility.bootstrap_jps(self.STEADY))
+
+    def test_thin_evidence_widens_to_infinity(self):
+        """One success in twelve leaves resamples where nothing succeeds;
+        carrying those as infinity is what stops a lucky run from minting."""
+        thin = [(100.0, True)] + [(90.0, False)] * 11
+        lo, hi = eligibility.bootstrap_jps(thin)
+        self.assertEqual(hi, float("inf"))
+        self.assertGreater(lo, 0)
+
+    def test_certificate_carries_the_interval(self):
+        cert = eligibility.distribution_cert(
+            "e" * 16, "f", "r", "c", "m", 12, 12, 6, 480.0, 20.0,
+            observations=self.STEADY)
+        self.assertIsNotNone(cert["jps_ci95"][0])
+
+    def test_overlapping_intervals_do_not_certify(self):
+        """Two runners whose energy intervals overlap have not been told
+        apart by the evidence, whatever their point estimates say. Real runs
+        scatter, and that scatter is exactly what decides the question."""
+        noisy_a = [(1.2, True), (1.9, True), (1.1, True), (2.1, True),
+                   (1.4, True), (1.8, True), (1.3, True), (2.0, True),
+                   (1.5, True), (1.7, True), (1.6, True), (1.4, True)]
+        noisy_b = [(1.5, True), (2.2, True), (1.3, True), (2.4, True),
+                   (1.6, True), (2.1, True), (1.4, True), (2.3, True),
+                   (1.8, True), (2.0, True), (1.9, True), (1.7, True)]
+        a = eligibility.distribution_cert("e" * 16, "f", "A", "h", "m", 12, 12,
+                                          12, sum(e for e, _ in noisy_a), 0.0,
+                                          observations=noisy_a)
+        b = eligibility.distribution_cert("e" * 16, "f", "B", "h", "m", 12, 12,
+                                          12, sum(e for e, _ in noisy_b), 0.0,
+                                          observations=noisy_b)
+        self.assertLess(a["j_per_success"], b["j_per_success"])
+        self.assertGreater(a["jps_ci95"][1], b["jps_ci95"][0])  # they overlap
+        self.assertFalse(eligibility.certified_dominates(a, b))
+
+    def test_identical_repeated_measurements_do_separate(self):
+        """The mirror case: twelve runs landing on the same value is strong
+        evidence, and the rule should say so rather than demand noise."""
+        a = eligibility.distribution_cert("e" * 16, "f", "A", "h", "m", 12, 12,
+                                          12, 16.8, 0.0,
+                                          observations=[(1.4, True)] * 12)
+        b = eligibility.distribution_cert("e" * 16, "f", "B", "h", "m", 12, 12,
+                                          12, 18.0, 0.0,
+                                          observations=[(1.5, True)] * 12)
+        self.assertTrue(eligibility.certified_dominates(a, b))
+
+    def test_separated_intervals_certify_and_say_why(self):
+        cheap = eligibility.distribution_cert(
+            "e" * 16, "f", "A", "h", "m", 12, 12, 12, 12.0, 0.0,
+            observations=[(1.0, True)] * 12)
+        dear = eligibility.distribution_cert(
+            "e" * 16, "f", "B", "h", "m", 12, 12, 12, 120.0, 0.0,
+            observations=[(10.0, True)] * 12)
+        self.assertTrue(eligibility.certified_dominates(cheap, dear))
+        basis = eligibility.certification_basis(cheap, dear)
+        self.assertTrue(any("bootstrap" in b for b in basis))
+
+    def test_legacy_certificate_falls_back_to_the_margin(self):
+        """Certificates written before per-run data was kept still work,
+        under the older and weaker rule."""
+        old_a = eligibility.distribution_cert("e" * 16, "f", "A", "h", "m",
+                                              12, 12, 12, 10.0, 0.0)
+        old_b = eligibility.distribution_cert("e" * 16, "f", "B", "h", "m",
+                                              12, 12, 12, 100.0, 0.0)
+        self.assertIsNone(old_a["jps_ci95"][0])
+        self.assertTrue(eligibility.certified_dominates(old_a, old_b))
